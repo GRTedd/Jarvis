@@ -1,84 +1,52 @@
-# Jarvis — CLI Session Coordinator
+# Jarvis — Claude Code Orchestrator
 
-A daemon that watches multiple terminal sessions, understands what they're doing, and helps them coordinate.
+A daemon that takes your prompts, decomposes them into subtasks, spawns parallel Claude Code CLI workers, and orchestrates them — all using your **Claude Max subscription**. No API key needed.
 
 **Cross-platform:** Works on Linux, macOS, and Windows.
+
+## What it does
+
+1. **You give Jarvis a task** — from the web dashboard or CLI
+2. **Jarvis decomposes it** — uses `claude -p` to break it into subtasks with dependencies
+3. **Spawns parallel workers** — each subtask gets its own `claude -p` instance
+4. **Orchestrates execution** — respects dependency ordering, runs independent work in parallel
+5. **Auto-rotates context** — when a worker hits 50% context usage, Jarvis asks it to write a checkpoint, then spawns a fresh CLI to continue
+6. **Coordinates sessions** — detects conflicts, duplicated work, and error cascades across all running sessions
 
 ## Architecture
 
 ```
-┌──────────────────────────────────────────────┐
-│              Jarvis Daemon                   │
-│  Unix socket (Linux/macOS) or TCP (Windows)  │
-│                                              │
-│  ┌─────────────┐  ┌───────────────────────┐  │
-│  │  Session     │  │  Coordinator Brain    │  │
-│  │  Registry    │  │  (LLM or rules-based) │  │
-│  │             │  │                       │  │
-│  │  sid → state │  │  Analyzes all session │  │
-│  │  sid → state │  │  context every 30s    │  │
-│  │  sid → state │  │  and injects messages │  │
-│  └─────────────┘  └───────────────────────┘  │
-└──────────┬───────────────────────────────────┘
-           │
-    ┌──────┴──────────────────────────┐
-    │      │           │              │
-┌───┴───┐ ┌┴────────┐ ┌┴──────────┐ ┌┴──────────┐
-│Session│ │Session  │ │Session   │ │Session   │
-│Proxy  │ │Proxy   │ │Proxy    │ │Proxy    │
-│(PTY)  │ │(PTY)   │ │(PTY)    │ │(PTY)    │
-│       │ │        │ │         │ │         │
-│claude │ │bash    │ │npm dev  │ │pytest   │
-└───────┘ └────────┘ └─────────┘ └─────────┘
+┌──────────────────────────────────────────────────────┐
+│                   Jarvis Daemon                      │
+│            (Python asyncio + aiohttp)                │
+│                                                      │
+│  ┌──────────────┐  ┌──────────────┐  ┌───────────┐  │
+│  │ Orchestrator  │  │ Coordinator  │  │    Web    │  │
+│  │              │  │    Brain     │  │ Dashboard │  │
+│  │ Decomposes   │  │              │  │           │  │
+│  │ tasks, spawns │  │ Analyzes all │  │ Real-time │  │
+│  │ workers,     │  │ sessions via │  │ control   │  │
+│  │ rotates ctx  │  │ claude -p    │  │ panel     │  │
+│  └──────┬───────┘  └──────────────┘  └───────────┘  │
+│         │                                            │
+└─────────┼────────────────────────────────────────────┘
+          │
+   ┌──────┴──────────────────────────────┐
+   │      │           │          │       │
+┌──┴──┐ ┌─┴───┐ ┌────┴──┐ ┌────┴──┐ ┌──┴───┐
+│ W#1 │ │ W#2 │ │ W#3  │ │ W#4  │ │ W#5  │
+│     │ │     │ │      │ │      │ │      │
+│claude│ │claude│ │claude │ │claude │ │claude │
+│ -p  │ │ -p  │ │  -p  │ │  -p  │ │  -p  │
+└─────┘ └─────┘ └──────┘ └──────┘ └──────┘
+  All workers use your Claude Max subscription
 ```
-
-### How it works
-
-1. **Daemon** listens on a Unix domain socket (Linux/macOS) or TCP localhost:9742 (Windows). Maintains a registry of all sessions with their rolling output buffers.
-
-2. **Session Proxy** wraps any command in a pseudo-terminal (PTY). Uses native `pty`/`fork` on Unix, `pywinpty` (ConPTY) on Windows. The user's experience is identical to running the command directly — full color, cursor control, interactive input. All I/O is transparently teed to the daemon.
-
-3. **Coordinator Brain** runs every 30 seconds, examines all session states, and injects coordination messages when it detects conflicts, duplicated work, errors cascading between sessions, or other coordination opportunities.
-
-### Platform details
-
-| | Linux/macOS | Windows |
-|---|---|---|
-| IPC | Unix domain socket (`/tmp/jarvis.sock`) | TCP `127.0.0.1:9742` |
-| PTY | Native `pty` + `fork` | `pywinpty` (ConPTY) |
-| Background daemon | `fork` + `setsid` | `subprocess` + `CREATE_NO_WINDOW` |
-| Temp files | `/tmp/jarvis*` | `%TEMP%\jarvis\*` |
-
-### Why PTY proxy (not tmux/shell hooks)?
-
-| Approach | I/O Visibility | Workflow Impact | Reliability |
-|----------|---------------|-----------------|-------------|
-| **PTY proxy** | Full bidirectional stream | Minimal (`jarvis spawn` prefix) | High — we own the pipe |
-| tmux parasitism | Lossy (capture-pane polling) | None if already using tmux | Medium — timing-dependent |
-| Shell hooks | Command-level only | None | Low — misses streaming output |
-
-The PTY proxy is the only approach that gives us a reliable, real-time, complete picture of every session's I/O. The tradeoff — adding `jarvis spawn` before your command — is trivial and can be aliased away.
-
-### How sessions know about Jarvis
-
-When spawned via `jarvis spawn`, the child process gets these environment variables:
-
-```
-JARVIS_ACTIVE=1              # Flag: "you're being watched"
-JARVIS_SESSION_ID=a1b2c3d4   # This session's unique ID
-JARVIS_SOCKET=/tmp/jarvis.sock  # Unix socket path, or 127.0.0.1:9742 on Windows
-```
-
-This means AI coding agents (Claude Code, Aider, etc.) can be made Jarvis-aware. They can:
-- Read `JARVIS_ACTIVE` to know they're part of a coordinated swarm
-- Connect to `JARVIS_SOCKET` directly to query sibling session state
-- Use `JARVIS_SESSION_ID` to identify themselves in coordination messages
 
 ## Quick Start
 
 ```bash
 # Install
-cd jarvis
+cd Jarvis
 pip install -e .
 
 # On Windows, also install:
@@ -88,6 +56,35 @@ pip install pywinpty
 jarvis start -d
 # Or: python -m jarvis start -d
 
+# Open the dashboard
+# http://127.0.0.1:9743
+
+# Submit a task from CLI
+jarvis task "Build a REST API with user auth in this project"
+jarvis task --cwd /path/to/project "Add unit tests for all endpoints"
+
+# Or type your task in the dashboard prompt bar
+```
+
+## Features
+
+### Task Orchestration
+- Submit a high-level prompt, Jarvis breaks it into subtasks
+- Parallel execution with configurable concurrency (default: 4 workers)
+- Dependency tracking — subtask B waits for subtask A if needed
+- Progress tracking with live output streaming on the dashboard
+
+### Context Window Rotation
+- Monitors each worker's context usage
+- At 50% context, the worker is asked to create a checkpoint file
+- A fresh `claude -p` instance picks up from the checkpoint
+- Up to 5 rotations per subtask (safety limit)
+- No work is lost — checkpoints include files modified, decisions made, and next steps
+
+### Session Monitoring
+You can also use Jarvis to monitor and coordinate manual sessions:
+
+```bash
 # Spawn monitored sessions (in separate terminals)
 jarvis spawn claude        # AI coding agent
 jarvis spawn bash          # regular shell
@@ -95,39 +92,69 @@ jarvis spawn npm run dev   # dev server
 
 # Check status
 jarvis status
-
-# View daemon logs
-jarvis logs
-
-# Stop daemon
-jarvis stop
 ```
 
-## Configuration
+### Coordination Brain
+Analyzes all active sessions every 30 seconds using `claude -p` and detects:
+- File conflicts (two sessions editing the same files)
+- Port collisions (multiple dev servers on the same port)
+- Error cascades (one session's changes breaking another)
+- Parallel git operations that could cause merge conflicts
+- Duplicated work across sessions
 
-Set `ANTHROPIC_API_KEY` for LLM-powered coordination analysis (optional — falls back to pattern matching without it):
+Falls back to fast rules-based pattern matching if `claude` CLI is unavailable.
 
-```bash
-export ANTHROPIC_API_KEY=sk-ant-...
+### Web Dashboard
+Real-time control panel at `http://127.0.0.1:9743`:
+- Task submission with prompt bar
+- Live subtask progress with expandable output
+- Session cards with terminal output preview
+- Coordination log sidebar
+- Broadcast messages to all sessions
+- Spawn new sessions from the UI
+
+## CLI Reference
+
+```
+jarvis start [-d]          Start daemon (foreground, or -d for background)
+jarvis stop                Stop the daemon
+jarvis status              Show all monitored sessions
+jarvis task "<prompt>"     Submit a task for orchestration
+jarvis spawn <cmd> [args]  Run a command under Jarvis monitoring
+jarvis logs                Tail the daemon log
 ```
 
-## What Jarvis detects (prototype)
+## How it works under the hood
 
-**Rules-based (no API key):**
-- Sessions working in the same directory
-- Port conflicts (e.g., two dev servers on :3000)
-- Error cascades (session A errors after session B modifies files)
-- Parallel git operations
+**Everything runs on `claude -p`** (Claude Code CLI in non-interactive mode):
 
-**LLM-powered (with API key):**
-- Everything above, plus semantic understanding of what each session is doing
-- Intelligent suggestions ("Session B is building the API that Session A needs — wait for it")
-- Natural language coordination messages
+| Component | What it does | How |
+|---|---|---|
+| Task decomposition | Breaks prompt into subtasks | `claude -p "decompose this..."` |
+| Workers | Execute each subtask | `claude -p "do this subtask..."` |
+| Checkpoints | Save state for context rotation | `claude -p "write checkpoint..."` |
+| Coordination | Analyze sessions for conflicts | `claude -p "analyze these sessions..."` |
+| Daemon | Routes, orchestrates, serves UI | Plain Python (no LLM) |
 
-## Future directions
+No API keys. No Anthropic SDK. Just `claude` CLI + your Max subscription.
 
-- **Shared context bus**: Sessions can publish/subscribe to topics (e.g., "I just deployed to staging")
-- **Dependency graph**: Declare what each session produces/consumes, auto-sequence work
-- **TUI dashboard**: Rich terminal UI showing all sessions side-by-side with Jarvis annotations
-- **MCP integration**: Expose Jarvis as an MCP server so Claude Code instances can query it natively
-- **Persistent memory**: Track patterns across restarts ("last time these two tasks ran together, X went wrong")
+## Platform details
+
+| | Linux/macOS | Windows |
+|---|---|---|
+| IPC | Unix domain socket (`/tmp/jarvis.sock`) | TCP `127.0.0.1:9742` |
+| PTY | Native `pty` + `fork` | `pywinpty` (ConPTY) |
+| Background daemon | `fork` + `setsid` | `subprocess` + `CREATE_NO_WINDOW` |
+| Temp files | `/tmp/jarvis*` | `%TEMP%\jarvis\*` |
+
+## Environment variables
+
+Inside monitored sessions (`jarvis spawn`), the child process gets:
+
+```
+JARVIS_ACTIVE=1              # Flag: "you're being watched"
+JARVIS_SESSION_ID=a1b2c3d4   # This session's unique ID
+JARVIS_SOCKET=/tmp/jarvis.sock  # Socket path, or 127.0.0.1:9742 on Windows
+```
+
+AI coding agents can read these to become Jarvis-aware and coordinate with siblings.
