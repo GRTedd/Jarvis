@@ -9,7 +9,6 @@ import asyncio
 import json
 import logging
 import os
-import re
 import sys
 import time
 import uuid
@@ -414,7 +413,7 @@ class Orchestrator:
         # Use -p for the initial prompt — one-shot mode.
         # For checkpoint-aware rotation, we'll use --output-format=stream-json
         # so we can detect context usage from the streaming metadata.
-        cmd = ["claude", "-p", prompt, "--output-format", "stream-json"]
+        cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose"]
 
         if IS_WINDOWS:
             CREATE_NO_WINDOW = 0x08000000
@@ -445,6 +444,7 @@ class Orchestrator:
         buffer = []
         needs_rotation = False
         context_pct = 0
+        session_id = None
 
         while True:
             line = await proc.stdout.readline()
@@ -458,23 +458,21 @@ class Orchestrator:
             try:
                 event = json.loads(raw)
                 # Stream JSON events may contain result with usage info
-                if event.get("type") == "result":
-                    usage = event.get("usage", {})
-                    input_tokens = usage.get("input_tokens", 0)
-                    # Claude Sonnet context is ~200k tokens
-                    # Estimate total context from model
-                    cache_read = usage.get("cache_read_input_tokens", 0)
-                    total_used = input_tokens + cache_read
-                    # Rough estimate: 200k context window
-                    max_context = 200_000
-                    if total_used > 0:
-                        context_pct = int((total_used / max_context) * 100)
+                etype = event.get("type")
+                if etype == "result":
+                    session_id = event.get("session_id")
+                    model_usage = event.get("modelUsage", {})
+                    for _model, usage in model_usage.items():
+                        input_tokens = usage.get("inputTokens", 0)
+                        cache_read = usage.get("cacheReadInputTokens", 0)
+                        cache_creation = usage.get("cacheCreationInputTokens", 0)
+                        context_window = usage.get("contextWindow", 200_000)
+                        total_used = input_tokens + cache_read + cache_creation
+                        if context_window > 0:
+                            context_pct = int((total_used / context_window) * 100)
+                        break
 
-                elif event.get("type") == "content_block_delta":
-                    delta = event.get("delta", {})
-                    text_to_display = delta.get("text", "")
-
-                elif event.get("type") == "assistant":
+                elif etype == "assistant":
                     # Initial message, may contain text
                     content = event.get("message", {}).get("content", [])
                     for block in content:
@@ -484,9 +482,6 @@ class Orchestrator:
             except (json.JSONDecodeError, KeyError):
                 # Not JSON — raw text output
                 text_to_display = raw
-
-            # Also check for context patterns in raw text
-            context_pct = self._parse_context_usage(raw, context_pct)
 
             if text_to_display:
                 buffer.append(text_to_display)
@@ -533,10 +528,21 @@ class Orchestrator:
 
         exit_code = await proc.wait()
 
-        if needs_rotation:
-            # Ask the worker to create a checkpoint by running a new short-lived
-            # claude -p that inspects the current state and writes a checkpoint file
-            await self._ask_worker_to_checkpoint(task, subtask, checkpoint_file)
+        if needs_rotation and session_id:
+            checkpoint_prompt = (
+                f"Your context window is at {context_pct}%. "
+                f"Write a detailed handoff checkpoint to: {checkpoint_file}\n\n"
+                f"Include:\n"
+                f"1. Everything you completed (specific files, functions, changes made)\n"
+                f"2. Any work that was in progress or partially done\n"
+                f"3. What still needs to be done to finish the original task\n"
+                f"4. Key decisions made and why\n"
+                f"5. Exact next steps for the session taking over\n\n"
+                f"Write the file now. Be precise — the next session has no memory except this file."
+            )
+            await self._run_claude_resume(session_id, checkpoint_prompt, task.cwd)
+            subtask.output += f"\n\n--- CONTEXT ROTATION (session {session_id}, {context_pct}%) ---\n\n"
+            subtask.pid = None
             return True
 
         subtask.exit_code = exit_code
@@ -558,73 +564,31 @@ class Orchestrator:
 
         return False
 
-    async def _ask_worker_to_checkpoint(self, task: Task, subtask: Subtask,
-                                         checkpoint_file: str):
-        """
-        Spawn a short claude -p to inspect the workspace and create a
-        checkpoint file that the next rotation can pick up.
-        This runs in the same working directory so it can see all files.
-        """
-        checkpoint_prompt = (
-            f"You are creating a handoff checkpoint for the next Claude Code session.\n\n"
-            f"The original task was:\n{subtask.prompt[:1000]}\n\n"
-            f"A previous session was working on this and got partway through.\n"
-            f"Examine the current state of the workspace (files, git status, etc.) "
-            f"and write a checkpoint file to: {checkpoint_file}\n\n"
-            f"The checkpoint MUST include:\n"
-            f"1. What has been accomplished so far (specific files, functions, changes)\n"
-            f"2. What was in progress / partially done\n"
-            f"3. What still needs to be done\n"
-            f"4. Any important context, decisions, or gotchas\n"
-            f"5. Specific next steps for the continuing session\n\n"
-            f"Write the checkpoint file now. Be specific and detailed about file paths "
-            f"and code state. The next session depends on this being accurate."
+    async def _run_claude_resume(self, session_id: str, prompt: str, cwd: str) -> str:
+        """Resume the same session so the original worker writes its own checkpoint."""
+        from .protocol import IS_WINDOWS
+
+        cmd = ["claude", "--resume", session_id, "-p", prompt, "--verbose"]
+
+        kwargs = dict(
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=cwd,
         )
+        if IS_WINDOWS:
+            kwargs["creationflags"] = 0x08000000
 
-        log.info(f"Asking worker to create checkpoint for subtask {subtask.id}...")
-        result = await self._run_claude(checkpoint_prompt, task.cwd)
-
-        # The claude -p should have created the file, but also try to read it
-        if os.path.exists(checkpoint_file):
-            log.info(f"Checkpoint file created at {checkpoint_file}")
-        else:
-            # Fallback: write the output as checkpoint
-            log.warning(f"Checkpoint file not found, using claude output as checkpoint")
-            try:
-                with open(checkpoint_file, "w", encoding="utf-8") as f:
-                    f.write(f"# Checkpoint for subtask {subtask.id}\n\n")
-                    f.write(f"## Original task\n{subtask.prompt[:1000]}\n\n")
-                    f.write(f"## Session output summary\n{result or 'No output'}\n")
-            except Exception as e:
-                log.error(f"Failed to write fallback checkpoint: {e}")
-
-    def _parse_context_usage(self, text: str, current_pct: int) -> int:
-        """
-        Parse context window usage from Claude CLI output.
-        The CLI may show context info in different formats.
-        Returns the latest known context percentage.
-        """
-        import re
-
-        # Pattern: "X% of context used" or "context: X%"
-        m = re.search(r'(\d{1,3})%\s*(?:of\s+)?context', text, re.IGNORECASE)
-        if m:
-            return int(m.group(1))
-
-        # Pattern: "Context window: X/Y tokens" — calculate percentage
-        m = re.search(r'(\d[\d,]+)\s*/\s*(\d[\d,]+)\s*tokens', text)
-        if m:
-            used = int(m.group(1).replace(',', ''))
-            total = int(m.group(2).replace(',', ''))
-            if total > 0:
-                return int((used / total) * 100)
-
-        # Pattern: compact status line with percentage
-        m = re.search(r'context[:\s]+(\d{1,3})%', text, re.IGNORECASE)
-        if m:
-            return int(m.group(1))
-
-        return current_pct
+        try:
+            proc = await asyncio.create_subprocess_exec(*cmd, **kwargs)
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+            result = stdout.decode("utf-8", errors="replace")
+            if proc.returncode != 0:
+                log.warning(f"claude --resume returned {proc.returncode}: {stderr.decode()[:200]}")
+            return result
+        except asyncio.TimeoutError:
+            log.error(f"claude --resume {session_id} timed out")
+            proc.kill()
+            return ""
 
     async def _read_checkpoint(self, task: Task, subtask: Subtask) -> str:
         """
