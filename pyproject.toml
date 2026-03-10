@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "jarvis-cli"
+version = "0.1.0"
+description = "Central daemon for coordinating CLI terminal sessions"
+requires-python = ">=3.10"
+dependencies = [
+    "httpx>=0.25",
+    "aiohttp>=3.9",
+]
+
+[project.optional-dependencies]
+windows = ["pywinpty>=2.0"]
+
+[project.scripts]
+jarvis = "jarvis.cli:main"
