@@ -1,124 +1,104 @@
 """
-Jarvis Coordinator Brain - LLM-powered session analysis.
+Jarvis Coordinator Brain — session analysis via Claude Code CLI.
 
-This module provides the intelligence layer. It periodically receives
-snapshots of all active sessions and uses Claude to:
-  1. Understand what each session is doing
-  2. Detect conflicts, duplicated work, or missed opportunities
-  3. Generate coordination messages to inject into sessions
-
-Can run in two modes:
-  - "llm" mode: Calls the Anthropic API for deep analysis
-  - "rules" mode: Uses pattern matching (no API key needed)
+Uses `claude -p` (your Max subscription) to analyze sessions.
+Falls back to rules-based pattern matching if claude CLI is unavailable.
+No API key needed.
 """
 
+import asyncio
 import json
 import logging
-import os
-from typing import Optional
+import re
+from collections import defaultdict
 
 log = logging.getLogger("jarvis.coordinator")
 
-SYSTEM_PROMPT = """You are Jarvis, a coordination daemon watching multiple CLI terminal sessions.
-
-You receive snapshots of terminal sessions that are running simultaneously. Your job is to:
-
-1. UNDERSTAND what each session is doing based on its command, working directory, and recent output.
-2. DETECT issues:
-   - File conflicts (two sessions editing the same files)
-   - Duplicated work (sessions doing the same thing independently)
-   - Error cascades (one session's changes causing errors in another)
-   - Dependency ordering (one session needs to wait for another)
-   - Resource conflicts (port collisions, lock files, etc.)
-3. SUGGEST coordination:
-   - Warn sessions about potential conflicts
-   - Tell sessions about relevant work happening elsewhere
-   - Suggest ordering or sequencing of work
-   - Flag when one session's output is relevant to another
-
-Respond with a JSON array of coordination actions. Each action:
-{
-  "target_sessions": ["session_id1", "session_id2"],
-  "message": "Brief, actionable message to display in the terminal",
-  "severity": "info" | "warning" | "critical",
-  "type": "conflict" | "duplicate" | "dependency" | "awareness" | "error_cascade"
-}
-
-If no coordination is needed, return an empty array: []
-
-Be concise. Terminal messages should be one line, max two. Developers are busy.
-Only flag things that are genuinely useful — don't be noisy."""
+SYSTEM_PROMPT = (
+    "You are Jarvis, a coordination daemon watching multiple CLI terminal sessions.\n\n"
+    "You receive snapshots of terminal sessions running simultaneously. Your job:\n\n"
+    "1. UNDERSTAND what each session is doing based on its command, cwd, and recent output.\n"
+    "2. DETECT issues:\n"
+    "   - File conflicts (two sessions editing the same files)\n"
+    "   - Duplicated work (sessions doing the same thing independently)\n"
+    "   - Error cascades (one session's changes causing errors in another)\n"
+    "   - Dependency ordering (one session needs to wait for another)\n"
+    "   - Resource conflicts (port collisions, lock files, etc.)\n"
+    "3. SUGGEST coordination:\n"
+    "   - Warn sessions about potential conflicts\n"
+    "   - Tell sessions about relevant work happening elsewhere\n"
+    "   - Suggest ordering or sequencing of work\n"
+    "   - Flag when one session's output is relevant to another\n\n"
+    "Respond with ONLY a JSON array of coordination actions. Each action:\n"
+    '{"target_sessions": ["id1"], "message": "Brief message", '
+    '"severity": "info"|"warning"|"critical", '
+    '"type": "conflict"|"duplicate"|"dependency"|"awareness"|"error_cascade"}\n\n'
+    "If no coordination is needed, return: []\n"
+    "Be concise. One line per message. Only flag genuinely useful things."
+)
 
 
 async def analyze_sessions_llm(sessions: list[dict]) -> list[dict]:
     """
-    Use the Anthropic API to analyze sessions and generate coordination insights.
-    Requires ANTHROPIC_API_KEY environment variable.
+    Use `claude -p` (Claude Code CLI) to analyze sessions.
+    Uses your Max subscription — no API key needed.
     """
-    api_key = os.environ.get("ANTHROPIC_API_KEY")
-    if not api_key:
-        log.warning("No ANTHROPIC_API_KEY set, falling back to rules-based analysis")
-        return analyze_sessions_rules(sessions)
+    prompt = (
+        f"{SYSTEM_PROMPT}\n\n"
+        f"Here are the currently active terminal sessions:\n\n"
+        f"{json.dumps(sessions, indent=2)}\n\n"
+        f"Analyze and return coordination actions as a JSON array."
+    )
 
     try:
-        import httpx
-    except ImportError:
-        log.warning("httpx not installed, falling back to rules-based analysis")
-        return analyze_sessions_rules(sessions)
+        from .protocol import IS_WINDOWS
 
-    prompt = f"""Here are the currently active terminal sessions:
+        cmd = ["claude", "-p", prompt]
 
-{json.dumps(sessions, indent=2)}
-
-Analyze these sessions and return coordination actions as JSON."""
-
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post(
-                "https://api.anthropic.com/v1/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "content-type": "application/json",
-                    "anthropic-version": "2023-06-01",
-                },
-                json={
-                    "model": "claude-sonnet-4-6",
-                    "max_tokens": 1024,
-                    "system": SYSTEM_PROMPT,
-                    "messages": [{"role": "user", "content": prompt}],
-                },
-                timeout=15.0,
+        if IS_WINDOWS:
+            CREATE_NO_WINDOW = 0x08000000
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
             )
 
-            if response.status_code != 200:
-                log.error(f"API error: {response.status_code} {response.text}")
-                return analyze_sessions_rules(sessions)
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=30)
+        text = stdout.decode("utf-8", errors="replace").strip()
 
-            data = response.json()
-            text = ""
-            for block in data.get("content", []):
-                if block.get("type") == "text":
-                    text += block["text"]
+        if proc.returncode != 0:
+            log.warning(f"claude -p returned {proc.returncode}, falling back to rules")
+            return analyze_sessions_rules(sessions)
 
-            # Parse JSON from response
-            # Handle potential markdown wrapping
-            text = text.strip()
-            if text.startswith("```"):
-                text = text.split("\n", 1)[1]
-                text = text.rsplit("```", 1)[0]
+        # Parse JSON — handle potential markdown wrapping
+        if text.startswith("```"):
+            text = text.split("\n", 1)[1]
+            text = text.rsplit("```", 1)[0]
 
-            actions = json.loads(text)
-            return actions if isinstance(actions, list) else []
+        actions = json.loads(text)
+        return actions if isinstance(actions, list) else []
 
-    except Exception as e:
-        log.error(f"LLM analysis failed: {e}")
+    except asyncio.TimeoutError:
+        log.warning("claude -p timed out, falling back to rules")
+        return analyze_sessions_rules(sessions)
+    except FileNotFoundError:
+        log.warning("claude CLI not found, falling back to rules")
+        return analyze_sessions_rules(sessions)
+    except (json.JSONDecodeError, Exception) as e:
+        log.warning(f"LLM analysis failed: {e}, falling back to rules")
         return analyze_sessions_rules(sessions)
 
 
 def analyze_sessions_rules(sessions: list[dict]) -> list[dict]:
     """
-    Rules-based fallback coordinator. Fast, no API needed.
-    Catches common patterns.
+    Rules-based fallback coordinator. Fast, no CLI call needed.
     """
     actions = []
 
@@ -126,7 +106,6 @@ def analyze_sessions_rules(sessions: list[dict]) -> list[dict]:
         return actions
 
     # Pattern: Same working directory
-    from collections import defaultdict
     cwd_groups = defaultdict(list)
     for s in sessions:
         cwd_groups[s["cwd"]].append(s)
@@ -142,12 +121,10 @@ def analyze_sessions_rules(sessions: list[dict]) -> list[dict]:
                 "type": "conflict",
             })
 
-    # Pattern: Port conflicts (common in dev)
+    # Pattern: Port conflicts
     port_users = defaultdict(list)
     for s in sessions:
         output = s.get("recent_output", "")
-        # Detect common port patterns
-        import re
         ports = re.findall(r'(?:localhost|127\.0\.0\.1|0\.0\.0\.0):(\d{4,5})', output)
         for port in ports:
             port_users[port].append(s)
@@ -157,19 +134,19 @@ def analyze_sessions_rules(sessions: list[dict]) -> list[dict]:
             ids = [s["session_id"] for s in users]
             actions.append({
                 "target_sessions": ids,
-                "message": f"Port {port} referenced by multiple sessions — possible conflict",
+                "message": f"Port {port} referenced by multiple sessions - possible conflict",
                 "severity": "warning",
                 "type": "conflict",
             })
 
-    # Pattern: One session has errors, another modified files
+    # Pattern: One session erroring, another modified files
     error_sessions = []
     modifier_sessions = []
     for s in sessions:
         output = s.get("recent_output", "").lower()
         if any(kw in output for kw in ["error", "traceback", "failed", "exception", "enoent"]):
             error_sessions.append(s)
-        if any(kw in output for kw in ["wrote", "saved", "created", "modified", "✓", "commit"]):
+        if any(kw in output for kw in ["wrote", "saved", "created", "modified", "commit"]):
             modifier_sessions.append(s)
 
     for err_s in error_sessions:
@@ -178,14 +155,14 @@ def analyze_sessions_rules(sessions: list[dict]) -> list[dict]:
                 actions.append({
                     "target_sessions": [err_s["session_id"]],
                     "message": (
-                        f"Session {mod_s['session_id'][:8]} recently modified files — "
+                        f"Session {mod_s['session_id'][:8]} recently modified files - "
                         f"might be related to your errors"
                     ),
                     "severity": "info",
                     "type": "error_cascade",
                 })
 
-    # Pattern: Git operations happening in parallel
+    # Pattern: Git operations in parallel
     git_sessions = [
         s for s in sessions
         if "git" in s.get("recent_output", "").lower()
@@ -195,7 +172,7 @@ def analyze_sessions_rules(sessions: list[dict]) -> list[dict]:
         ids = [s["session_id"] for s in git_sessions]
         actions.append({
             "target_sessions": ids,
-            "message": "Multiple sessions doing git operations — coordinate to avoid merge conflicts",
+            "message": "Multiple sessions doing git operations - coordinate to avoid merge conflicts",
             "severity": "warning",
             "type": "conflict",
         })

@@ -82,9 +82,16 @@ def cmd_start(background: bool = False):
                     cwd=os.getcwd(),
                 )
 
-            time.sleep(0.5)
+            # Wait for PID file to appear (daemon writes it on startup)
+            for _ in range(20):
+                time.sleep(0.25)
+                if daemon_is_running():
+                    break
+
             if daemon_is_running():
+                from .protocol import WEB_HOST, WEB_PORT
                 print(f"\033[1;36m[JARVIS]\033[0m Daemon started (PID {proc.pid})")
+                print(f"\033[1;36m[JARVIS]\033[0m Dashboard: http://{WEB_HOST}:{WEB_PORT}")
             else:
                 print("\033[1;31m[JARVIS]\033[0m Failed to start daemon")
                 print(f"Check log: {LOG_FILE}")
