@@ -11,6 +11,13 @@ Provides:
   - POST /api/inject/{id} → Inject message into one session
   - POST /api/coordinate → Trigger coordination analysis
   - GET /ws            → WebSocket for real-time events
+
+Agent Communication:
+  - POST /api/agent/ask           → Worker asks Jarvis a question (blocks)
+  - POST /api/agent/answer/{qid}  → Answer a pending question
+  - POST /api/agent/message        → Agent-to-agent message (via Jarvis broker)
+  - GET  /api/agent/poll/{tid}/{sid} → Worker polls inbox for messages
+  - POST /api/tasks/{tid}/subtasks/{sid}/message → Push message to worker
 """
 
 import asyncio
@@ -20,6 +27,7 @@ import os
 import subprocess
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -51,6 +59,13 @@ def create_web_app(daemon: "JarvisDaemon") -> web.Application:
     app.router.add_get("/api/tasks", handle_tasks_list)
     app.router.add_get("/api/tasks/{tid}", handle_task_detail)
     app.router.add_post("/api/tasks/{tid}/cancel", handle_task_cancel)
+
+    # Agent communication endpoints
+    app.router.add_post("/api/agent/ask", handle_agent_ask)
+    app.router.add_post("/api/agent/answer/{qid}", handle_agent_answer)
+    app.router.add_post("/api/agent/message", handle_agent_message)
+    app.router.add_get("/api/agent/poll/{task_id}/{subtask_id}", handle_agent_poll)
+    app.router.add_post("/api/tasks/{tid}/subtasks/{sid}/message", handle_worker_message)
 
     return app
 
@@ -205,6 +220,151 @@ async def handle_task_cancel(request: web.Request) -> web.Response:
     if ok:
         return web.json_response({"ok": True})
     return web.json_response({"error": "Task not found"}, status=404)
+
+
+async def handle_agent_ask(request: web.Request) -> web.Response:
+    """Worker asks Jarvis a question — blocks until answered or timeout."""
+    daemon = request.app["daemon"]
+    data = await request.json()
+    task_id = data.get("task_id", "")
+    subtask_id = data.get("subtask_id", "")
+    question = data.get("question", "").strip()
+
+    if not question:
+        return web.json_response({"error": "No question provided"}, status=400)
+
+    task = daemon.orchestrator.tasks.get(task_id)
+    if not task:
+        return web.json_response({"error": "Task not found"}, status=404)
+
+    subtask = next((s for s in task.subtasks if s.id == subtask_id), None)
+    if not subtask:
+        return web.json_response({"error": "Subtask not found"}, status=404)
+
+    qid = uuid.uuid4().hex[:8]
+    event = asyncio.Event()
+    answer_holder = {}
+
+    q_entry = {
+        "qid": qid,
+        "question": question,
+        "subtask_id": subtask_id,
+        "task_id": task_id,
+        "event": event,
+        "answer": answer_holder,
+        "timestamp": time.time(),
+    }
+    subtask.pending_questions.append(q_entry)
+
+    # Notify dashboard so operator can see and answer
+    await daemon.notify_ws({
+        "event": "agent_question",
+        "qid": qid,
+        "task_id": task_id,
+        "subtask_id": subtask_id,
+        "question": question,
+        "timestamp": time.time(),
+    })
+
+    log.info(f"Worker #{subtask_id} asks: {question[:100]}")
+
+    # Block until answered (up to 5 min)
+    try:
+        await asyncio.wait_for(event.wait(), timeout=300)
+    except asyncio.TimeoutError:
+        subtask.pending_questions = [q for q in subtask.pending_questions if q["qid"] != qid]
+        return web.json_response({"answer": "No response within timeout -- use your best judgment."})
+
+    answer = answer_holder.get("answer", "")
+    subtask.pending_questions = [q for q in subtask.pending_questions if q["qid"] != qid]
+    return web.json_response({"answer": answer})
+
+
+async def handle_agent_answer(request: web.Request) -> web.Response:
+    """Dashboard or coordinator posts an answer to a pending question."""
+    daemon = request.app["daemon"]
+    qid = request.match_info["qid"]
+    data = await request.json()
+    answer = data.get("answer", "")
+
+    # Find the pending question across all tasks/subtasks
+    for task in daemon.orchestrator.tasks.values():
+        for subtask in task.subtasks:
+            for q in subtask.pending_questions:
+                if q["qid"] == qid:
+                    q["answer"]["answer"] = answer
+                    q["event"].set()
+                    await daemon.notify_ws({
+                        "event": "agent_answered",
+                        "qid": qid,
+                        "task_id": q["task_id"],
+                        "subtask_id": q["subtask_id"],
+                        "answer": answer,
+                        "timestamp": time.time(),
+                    })
+                    log.info(f"Question {qid} answered: {answer[:100]}")
+                    return web.json_response({"ok": True})
+
+    return web.json_response({"error": "Question not found"}, status=404)
+
+
+async def handle_agent_message(request: web.Request) -> web.Response:
+    """Agent-to-agent messaging, routed through Jarvis as broker."""
+    daemon = request.app["daemon"]
+    data = await request.json()
+    task_id = data.get("task_id", "")
+    to_id = data.get("to_id", "")
+    message = data.get("message", "").strip()
+    from_id = data.get("from_id", "unknown")
+
+    if not message:
+        return web.json_response({"error": "No message provided"}, status=400)
+
+    ok = await daemon.orchestrator.message_worker(
+        task_id, to_id,
+        f"[from worker #{from_id}]: {message}"
+    )
+    if ok:
+        return web.json_response({"ok": True})
+    return web.json_response({"error": "Target worker not found"}, status=404)
+
+
+async def handle_agent_poll(request: web.Request) -> web.Response:
+    """Worker polls for queued messages from Jarvis or siblings."""
+    daemon = request.app["daemon"]
+    task_id = request.match_info["task_id"]
+    subtask_id = request.match_info["subtask_id"]
+
+    task = daemon.orchestrator.tasks.get(task_id)
+    if not task:
+        return web.json_response({"messages": []})
+
+    subtask = next((s for s in task.subtasks if s.id == subtask_id), None)
+    if not subtask:
+        return web.json_response({"messages": []})
+
+    # Drain the inbox
+    messages = list(subtask._inbox)
+    subtask._inbox.clear()
+
+    return web.json_response({"messages": messages})
+
+
+async def handle_worker_message(request: web.Request) -> web.Response:
+    """Dashboard/operator sends guidance to a running worker."""
+    daemon = request.app["daemon"]
+    tid = request.match_info["tid"]
+    sid = request.match_info["sid"]
+    data = await request.json()
+    message = data.get("message", "").strip()
+
+    if not message:
+        return web.json_response({"error": "No message provided"}, status=400)
+
+    ok = await daemon.orchestrator.message_worker(tid, sid, message)
+    if ok:
+        return web.json_response({"ok": True})
+    return web.json_response({"error": "Worker not found"}, status=404)
 
 
 async def handle_ws(request: web.Request) -> web.WebSocketResponse:

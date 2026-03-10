@@ -46,6 +46,9 @@ class Subtask:
     output: str = ""
     started_at: Optional[float] = None
     finished_at: Optional[float] = None
+    # Agent communication
+    pending_questions: list = field(default_factory=list)
+    _inbox: list = field(default_factory=list, repr=False)
 
     def to_dict(self) -> dict:
         return {
@@ -64,6 +67,10 @@ class Subtask:
                 round((self.finished_at or time.time()) - self.started_at, 1)
                 if self.started_at else None
             ),
+            "pending_questions": [
+                {"qid": q["qid"], "question": q["question"], "subtask_id": q["subtask_id"]}
+                for q in self.pending_questions
+            ],
         }
 
 
@@ -155,6 +162,31 @@ DECOMPOSE_PROMPT = (
 )
 
 
+WORKER_PREAMBLE = """You are worker #{subtask_id} ("{title}") of task {task_id}, running under Jarvis orchestration.
+Jarvis API: {api_url}
+
+## Communication with Jarvis
+If you are uncertain, blocked, or need clarification, ask Jarvis:
+  curl -s -X POST {api_url}/api/agent/ask \\
+    -H 'Content-Type: application/json' \\
+    -d '{{"task_id":"{task_id}","subtask_id":"{subtask_id}","question":"your question here"}}'
+The response JSON has an "answer" field. This call BLOCKS until a human or Jarvis answers (up to 5 min).
+
+## Messaging sibling workers
+To send a message to another worker (e.g. worker #2):
+  curl -s -X POST {api_url}/api/agent/message \\
+    -H 'Content-Type: application/json' \\
+    -d '{{"task_id":"{task_id}","from_id":"{subtask_id}","to_id":"2","message":"your message"}}'
+
+## Checking for messages from Jarvis or siblings
+Every few tool calls, check your inbox:
+  curl -s {api_url}/api/agent/poll/{task_id}/{subtask_id}
+Returns {{"messages": [...]}}. Act on any messages you receive.
+
+---
+"""
+
+
 class Orchestrator:
     def __init__(self, daemon: "JarvisDaemon"):
         self.daemon = daemon
@@ -191,6 +223,28 @@ class Orchestrator:
             if sub.status in (TaskStatus.PENDING, TaskStatus.WAITING, TaskStatus.RUNNING):
                 sub.status = TaskStatus.CANCELLED
         await self._notify_task_update(task)
+        return True
+
+    async def message_worker(self, task_id: str, subtask_id: str, message: str) -> bool:
+        """Push a message into a worker's inbox for pickup via polling."""
+        task = self.tasks.get(task_id)
+        if not task:
+            return False
+        subtask = next((s for s in task.subtasks if s.id == subtask_id), None)
+        if not subtask:
+            return False
+        subtask._inbox.append({
+            "from": "jarvis",
+            "message": message,
+            "timestamp": time.time(),
+        })
+        await self.daemon.notify_ws({
+            "event": "worker_messaged",
+            "task_id": task_id,
+            "subtask_id": subtask_id,
+            "message": message,
+            "timestamp": time.time(),
+        })
         return True
 
     async def _run_task(self, task: Task):
@@ -399,8 +453,19 @@ class Orchestrator:
         """
         from .protocol import IS_WINDOWS
 
+        # Build API URL from daemon's web port
+        web_port = int(os.environ.get("JARVIS_WEB_PORT", "9743"))
+        api_url = f"http://localhost:{web_port}"
+
+        preamble = WORKER_PREAMBLE.format(
+            subtask_id=subtask.id,
+            title=subtask.title,
+            task_id=task.id,
+            api_url=api_url,
+        )
+
         prompt = continuation_prompt or (
-            f"You are worker #{subtask.id} in a coordinated task. "
+            preamble +
             f"Your specific assignment:\n\n{subtask.prompt}\n\n"
             f"Work in the current directory. Be thorough but focused on your specific task."
         )

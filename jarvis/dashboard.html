@@ -780,6 +780,91 @@
     gap: 8px;
   }
 
+  /* --- Agent Questions Panel --- */
+  .questions-section {
+    border-bottom: 1px solid var(--border);
+    max-height: 300px;
+    overflow-y: auto;
+  }
+
+  .questions-section:empty { display: none; }
+
+  .question-card {
+    padding: 10px 12px;
+    margin: 6px 8px;
+    border-radius: 8px;
+    background: rgba(234, 179, 8, 0.06);
+    border: 1px solid rgba(234, 179, 8, 0.2);
+  }
+
+  .question-card.answered {
+    background: rgba(34, 197, 94, 0.06);
+    border-color: rgba(34, 197, 94, 0.2);
+    opacity: 0.6;
+  }
+
+  .question-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 6px;
+  }
+
+  .question-source {
+    font-size: 11px;
+    font-weight: 600;
+    color: var(--yellow);
+  }
+
+  .question-card.answered .question-source { color: var(--green); }
+
+  .question-time {
+    font-size: 10px;
+    color: var(--text-dim);
+  }
+
+  .question-text {
+    font-size: 12px;
+    color: var(--text);
+    line-height: 1.5;
+    margin-bottom: 8px;
+  }
+
+  .question-answer-row {
+    display: flex;
+    gap: 6px;
+  }
+
+  .question-answer-row input {
+    flex: 1;
+    padding: 6px 10px;
+    border-radius: 6px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 12px;
+    outline: none;
+  }
+
+  .question-answer-row input:focus {
+    border-color: var(--yellow);
+  }
+
+  .question-answer-row .btn {
+    padding: 4px 10px;
+    font-size: 11px;
+    background: var(--yellow);
+    border-color: var(--yellow);
+    color: #000;
+    font-weight: 600;
+  }
+
+  .question-answered-text {
+    font-size: 11px;
+    color: var(--green);
+    font-style: italic;
+  }
+
   /* --- Notification toast --- */
   .toast {
     position: fixed;
@@ -871,6 +956,9 @@
 
   <!-- Sidebar -->
   <div class="sidebar">
+    <!-- Pending Agent Questions -->
+    <div class="questions-section" id="questionsSection"></div>
+
     <div class="sidebar-section">
       <div class="sidebar-header">
         <span>Coordination Log</span>
@@ -940,6 +1028,7 @@ let logEntries = [];
 let reconnectTimer = null;
 let tasks = {};
 let expandedSubtasks = {};
+let pendingQuestions = {}; // qid -> {qid, task_id, subtask_id, question, timestamp, answered, answer}
 
 // --- Strip ANSI escape codes for display ---
 function stripAnsi(str) {
@@ -1092,6 +1181,39 @@ function handleEvent(msg) {
         targets: [msg.task_id],
       };
       logEntries.push(rotEntry);
+      renderLog();
+      break;
+
+    case 'agent_question':
+      pendingQuestions[msg.qid] = {
+        qid: msg.qid,
+        task_id: msg.task_id,
+        subtask_id: msg.subtask_id,
+        question: msg.question,
+        timestamp: msg.timestamp,
+        answered: false,
+        answer: '',
+      };
+      renderQuestions();
+      toast(`Worker #${msg.subtask_id} is asking a question`);
+      break;
+
+    case 'agent_answered':
+      if (pendingQuestions[msg.qid]) {
+        pendingQuestions[msg.qid].answered = true;
+        pendingQuestions[msg.qid].answer = msg.answer;
+        renderQuestions();
+      }
+      break;
+
+    case 'worker_messaged':
+      logEntries.push({
+        timestamp: msg.timestamp || Date.now()/1000,
+        message: `Message sent to worker #${msg.subtask_id}: ${msg.message}`,
+        severity: 'info',
+        type: 'worker_message',
+        targets: [msg.task_id],
+      });
       renderLog();
       break;
   }
@@ -1434,11 +1556,12 @@ function createTaskCard(task) {
       task.subtasks.map(s => {
         const isExpanded = expandedSubtasks[task.id + '-' + s.id];
         const dur = s.duration ? `${Math.round(s.duration)}s` : '';
+        const msgBtn = s.status === 'running' ? `<button class="btn" onclick="event.stopPropagation();messageWorker('${task.id}','${s.id}')" style="padding:2px 8px;font-size:10px;">Msg</button>` : '';
         return `
           <div class="subtask-row" onclick="toggleSubtask('${task.id}','${s.id}')">
             <div class="subtask-status-dot ${s.status}"></div>
             <div class="subtask-title">#${s.id} ${escHtml(s.title)}</div>
-            <div class="subtask-meta">${s.status}${dur ? ' · ' + dur : ''}</div>
+            <div class="subtask-meta">${s.status}${dur ? ' · ' + dur : ''} ${msgBtn}</div>
           </div>
           <div class="subtask-output-preview ${isExpanded ? 'visible' : ''}" id="subout-${task.id}-${s.id}">${escHtml(stripAnsi(s.output_tail || '').split('\\n').slice(-8).join('\\n'))}</div>
         `;
@@ -1492,6 +1615,111 @@ async function cancelTask(taskId) {
   try {
     await fetch(`${API}/api/tasks/${taskId}/cancel`, { method: 'POST' });
     toast('Task cancelled');
+  } catch (e) {
+    toast('Error: ' + e.message);
+  }
+}
+
+// --- Agent Questions ---
+function renderQuestions() {
+  const section = document.getElementById('questionsSection');
+  const qids = Object.keys(pendingQuestions);
+
+  if (qids.length === 0) {
+    section.innerHTML = '';
+    return;
+  }
+
+  // Unanswered first, then by timestamp (newest first)
+  qids.sort((a, b) => {
+    const qa = pendingQuestions[a], qb = pendingQuestions[b];
+    if (qa.answered !== qb.answered) return qa.answered ? 1 : -1;
+    return qb.timestamp - qa.timestamp;
+  });
+
+  let html = '<div class="sidebar-header"><span>Agent Questions</span><span style="font-size:11px;color:var(--yellow)">' +
+    qids.filter(q => !pendingQuestions[q].answered).length + ' pending</span></div>';
+
+  for (const qid of qids) {
+    const q = pendingQuestions[qid];
+    const t = new Date(q.timestamp * 1000).toLocaleTimeString();
+
+    if (q.answered) {
+      html += `
+        <div class="question-card answered">
+          <div class="question-header">
+            <span class="question-source">Worker #${escHtml(q.subtask_id)} — answered</span>
+            <span class="question-time">${t}</span>
+          </div>
+          <div class="question-text">${escHtml(q.question)}</div>
+          <div class="question-answered-text">${escHtml(q.answer)}</div>
+        </div>`;
+    } else {
+      html += `
+        <div class="question-card">
+          <div class="question-header">
+            <span class="question-source">Worker #${escHtml(q.subtask_id)} asks:</span>
+            <span class="question-time">${t}</span>
+          </div>
+          <div class="question-text">${escHtml(q.question)}</div>
+          <div class="question-answer-row">
+            <input id="ans-${qid}" placeholder="Type your answer..."
+                   onkeydown="if(event.key==='Enter')answerQuestion('${qid}')">
+            <button class="btn" onclick="answerQuestion('${qid}')">Answer</button>
+          </div>
+        </div>`;
+    }
+  }
+
+  section.innerHTML = html;
+
+  // Auto-focus the first unanswered question's input
+  const firstUnanswered = qids.find(q => !pendingQuestions[q].answered);
+  if (firstUnanswered) {
+    const input = document.getElementById(`ans-${firstUnanswered}`);
+    if (input) input.focus();
+  }
+}
+
+async function answerQuestion(qid) {
+  const input = document.getElementById(`ans-${qid}`);
+  if (!input) return;
+  const answer = input.value.trim();
+  if (!answer) return;
+
+  try {
+    const resp = await fetch(`${API}/api/agent/answer/${qid}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ answer }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      if (pendingQuestions[qid]) {
+        pendingQuestions[qid].answered = true;
+        pendingQuestions[qid].answer = answer;
+      }
+      renderQuestions();
+      toast('Answer sent to worker');
+    } else {
+      toast('Error: ' + (data.error || 'Unknown'));
+    }
+  } catch (e) {
+    toast('Error: ' + e.message);
+  }
+}
+
+async function messageWorker(taskId, subtaskId) {
+  const msg = prompt('Message to send to this worker:');
+  if (!msg) return;
+
+  try {
+    await fetch(`${API}/api/tasks/${taskId}/subtasks/${subtaskId}/message`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ message: msg }),
+    });
+    toast(`Message sent to worker #${subtaskId}`);
   } catch (e) {
     toast('Error: ' + e.message);
   }
