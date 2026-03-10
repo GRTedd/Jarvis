@@ -375,9 +375,21 @@ async def handle_ws(request: web.Request) -> web.WebSocketResponse:
     daemon.ws_clients.add(ws)
     log.info(f"Dashboard WebSocket connected ({len(daemon.ws_clients)} clients)")
 
-    # Send initial status snapshot
+    # Send initial status snapshot (including any in-flight agent questions)
     status = daemon.get_status()
     status["coordination_log"] = list(daemon.coordination_log)
+    pending = []
+    for task in daemon.orchestrator.tasks.values():
+        for sub in task.subtasks:
+            for q in sub.pending_questions:
+                pending.append({
+                    "qid": q["qid"],
+                    "task_id": q["task_id"],
+                    "subtask_id": q["subtask_id"],
+                    "question": q["question"],
+                    "timestamp": q["timestamp"],
+                })
+    status["pending_questions"] = pending
     await ws.send_json({"event": "status", **status})
 
     try:

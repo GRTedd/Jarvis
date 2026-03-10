@@ -454,8 +454,8 @@ class Orchestrator:
         from .protocol import IS_WINDOWS
 
         # Build API URL from daemon's web port
-        web_port = int(os.environ.get("JARVIS_WEB_PORT", "9743"))
-        api_url = f"http://localhost:{web_port}"
+        from .protocol import WEB_PORT
+        api_url = f"http://localhost:{WEB_PORT}"
 
         preamble = WORKER_PREAMBLE.format(
             subtask_id=subtask.id,
@@ -464,11 +464,14 @@ class Orchestrator:
             api_url=api_url,
         )
 
-        prompt = continuation_prompt or (
-            preamble +
-            f"Your specific assignment:\n\n{subtask.prompt}\n\n"
-            f"Work in the current directory. Be thorough but focused on your specific task."
-        )
+        if continuation_prompt:
+            prompt = preamble + continuation_prompt
+        else:
+            prompt = (
+                preamble +
+                f"Your specific assignment:\n\n{subtask.prompt}\n\n"
+                f"Work in the current directory. Be thorough but focused on your specific task."
+            )
 
         checkpoint_file = os.path.join(
             task.cwd,

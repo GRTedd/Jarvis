@@ -1087,6 +1087,22 @@ function handleEvent(msg) {
       if (msg.coordination_log) {
         logEntries = msg.coordination_log;
       }
+      if (msg.pending_questions) {
+        for (const q of msg.pending_questions) {
+          if (!pendingQuestions[q.qid]) {
+            pendingQuestions[q.qid] = {
+              qid: q.qid,
+              task_id: q.task_id,
+              subtask_id: q.subtask_id,
+              question: q.question,
+              timestamp: q.timestamp,
+              answered: false,
+              answer: '',
+            };
+          }
+        }
+        renderQuestions();
+      }
       renderSessions();
       renderLog();
       break;
