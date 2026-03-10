@@ -46,6 +46,12 @@ def create_web_app(daemon: "JarvisDaemon") -> web.Application:
     app.router.add_post("/api/coordinate", handle_coordinate)
     app.router.add_get("/ws", handle_ws)
 
+    # Orchestrator endpoints
+    app.router.add_post("/api/task", handle_task_submit)
+    app.router.add_get("/api/tasks", handle_tasks_list)
+    app.router.add_get("/api/tasks/{tid}", handle_task_detail)
+    app.router.add_post("/api/tasks/{tid}/cancel", handle_task_cancel)
+
     return app
 
 
@@ -161,6 +167,44 @@ async def handle_coordinate(request: web.Request) -> web.Response:
         "ok": True,
         "coordination_log": list(daemon.coordination_log[-5:]),
     })
+
+
+async def handle_task_submit(request: web.Request) -> web.Response:
+    daemon = request.app["daemon"]
+    data = await request.json()
+    prompt = data.get("prompt", "").strip()
+    cwd = data.get("cwd", os.getcwd())
+    max_parallel = int(data.get("max_parallel", 4))
+
+    if not prompt:
+        return web.json_response({"error": "No prompt provided"}, status=400)
+
+    task = await daemon.orchestrator.submit_task(prompt, cwd, max_parallel)
+    return web.json_response({"ok": True, "task": task.to_dict()})
+
+
+async def handle_tasks_list(request: web.Request) -> web.Response:
+    daemon = request.app["daemon"]
+    tasks = daemon.orchestrator.get_all_tasks()
+    return web.json_response({"tasks": tasks})
+
+
+async def handle_task_detail(request: web.Request) -> web.Response:
+    daemon = request.app["daemon"]
+    tid = request.match_info["tid"]
+    task = daemon.orchestrator.get_task(tid)
+    if not task:
+        return web.json_response({"error": "Task not found"}, status=404)
+    return web.json_response({"task": task})
+
+
+async def handle_task_cancel(request: web.Request) -> web.Response:
+    daemon = request.app["daemon"]
+    tid = request.match_info["tid"]
+    ok = await daemon.orchestrator.cancel_task(tid)
+    if ok:
+        return web.json_response({"ok": True})
+    return web.json_response({"error": "Task not found"}, status=404)
 
 
 async def handle_ws(request: web.Request) -> web.WebSocketResponse:

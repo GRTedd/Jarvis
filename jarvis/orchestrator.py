@@ -1,0 +1,706 @@
+"""
+Jarvis Orchestrator — Takes a high-level prompt, decomposes it into subtasks
+using `claude -p`, then spawns and manages Claude Code workers for each subtask.
+
+Uses your Claude Max subscription via the CLI — no API key needed.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import re
+import sys
+import time
+import uuid
+from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
+from typing import Optional, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .daemon import JarvisDaemon
+
+log = logging.getLogger("jarvis.orchestrator")
+
+
+class TaskStatus(str, Enum):
+    PENDING = "pending"
+    DECOMPOSING = "decomposing"
+    RUNNING = "running"
+    WAITING = "waiting"      # waiting on dependencies
+    COMPLETED = "completed"
+    FAILED = "failed"
+    CANCELLED = "cancelled"
+
+
+@dataclass
+class Subtask:
+    id: str
+    title: str
+    prompt: str
+    depends_on: list[str] = field(default_factory=list)
+    status: TaskStatus = TaskStatus.PENDING
+    session_id: Optional[str] = None
+    pid: Optional[int] = None
+    exit_code: Optional[int] = None
+    output: str = ""
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "title": self.title,
+            "prompt": self.prompt[:200] + ("..." if len(self.prompt) > 200 else ""),
+            "depends_on": self.depends_on,
+            "status": self.status.value,
+            "session_id": self.session_id,
+            "pid": self.pid,
+            "exit_code": self.exit_code,
+            "output_tail": self.output[-500:] if self.output else "",
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "duration": (
+                round((self.finished_at or time.time()) - self.started_at, 1)
+                if self.started_at else None
+            ),
+        }
+
+
+@dataclass
+class Task:
+    id: str
+    prompt: str
+    cwd: str
+    status: TaskStatus = TaskStatus.PENDING
+    subtasks: list[Subtask] = field(default_factory=list)
+    created_at: float = field(default_factory=time.time)
+    finished_at: Optional[float] = None
+    error: Optional[str] = None
+    max_parallel: int = 4
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "prompt": self.prompt[:300] + ("..." if len(self.prompt) > 300 else ""),
+            "cwd": self.cwd,
+            "status": self.status.value,
+            "subtasks": [s.to_dict() for s in self.subtasks],
+            "created_at": self.created_at,
+            "finished_at": self.finished_at,
+            "error": self.error,
+            "max_parallel": self.max_parallel,
+            "progress": self._progress(),
+        }
+
+    def _progress(self) -> dict:
+        total = len(self.subtasks)
+        if total == 0:
+            return {"total": 0, "completed": 0, "running": 0, "failed": 0, "pending": 0}
+        return {
+            "total": total,
+            "completed": sum(1 for s in self.subtasks if s.status == TaskStatus.COMPLETED),
+            "running": sum(1 for s in self.subtasks if s.status == TaskStatus.RUNNING),
+            "failed": sum(1 for s in self.subtasks if s.status == TaskStatus.FAILED),
+            "pending": sum(1 for s in self.subtasks if s.status in (TaskStatus.PENDING, TaskStatus.WAITING)),
+        }
+
+
+CONTEXT_ROTATION_THRESHOLD = 50  # Rotate at 50% context usage
+
+CHECKPOINT_FILENAME = ".jarvis_checkpoint_{subtask_id}.md"
+
+CHECKPOINT_PROMPT = """You are continuing work from a previous Claude Code session that ran out of context.
+
+Here is the checkpoint created by the previous session:
+{checkpoint}
+
+Here is the original task:
+{original_task}
+
+Continue where the previous session left off. Do NOT redo work that's already done.
+Focus on what still needs to be completed. The checkpoint above was written by the
+previous worker to tell you exactly where they left off."""
+
+DECOMPOSE_PROMPT = (
+    "You are a task decomposition engine. Given a high-level task, break it into "
+    "concrete subtasks that can each be executed by an independent Claude Code CLI instance.\n\n"
+    "Rules:\n"
+    "- Each subtask should be a self-contained unit of work\n"
+    "- Subtasks that can run in parallel should have no dependencies between them\n"
+    "- If subtask B needs subtask A to finish first, mark B as depending on A\n"
+    "- Each subtask gets its own terminal - they share the filesystem but not state\n"
+    "- Be specific in each subtask prompt - include file paths, function names, etc.\n"
+    "- Keep subtask count reasonable (2-8 typically)\n"
+    "- If the task is simple enough for one worker, return just one subtask\n\n"
+    "Working directory: {cwd}\n\n"
+    "Return ONLY valid JSON (no markdown, no explanation) in this exact format:\n"
+    '{{\n'
+    '  "subtasks": [\n'
+    '    {{\n'
+    '      "id": "1",\n'
+    '      "title": "Short title",\n'
+    '      "prompt": "Detailed prompt for the Claude Code worker...",\n'
+    '      "depends_on": []\n'
+    '    }},\n'
+    '    {{\n'
+    '      "id": "2",\n'
+    '      "title": "Short title",\n'
+    '      "prompt": "Detailed prompt...",\n'
+    '      "depends_on": ["1"]\n'
+    '    }}\n'
+    '  ]\n'
+    '}}\n\n'
+    "Task to decompose:\n{task}"
+)
+
+
+class Orchestrator:
+    def __init__(self, daemon: "JarvisDaemon"):
+        self.daemon = daemon
+        self.tasks: dict[str, Task] = {}
+        self._monitor_task: Optional[asyncio.Task] = None
+
+    async def submit_task(self, prompt: str, cwd: str, max_parallel: int = 4) -> Task:
+        """Submit a new task for orchestration."""
+        task = Task(
+            id=uuid.uuid4().hex[:10],
+            prompt=prompt,
+            cwd=cwd,
+            max_parallel=max_parallel,
+        )
+        self.tasks[task.id] = task
+
+        await self.daemon.notify_ws({
+            "event": "task_submitted",
+            "task": task.to_dict(),
+        })
+
+        # Start decomposition in background
+        asyncio.create_task(self._run_task(task))
+        return task
+
+    async def cancel_task(self, task_id: str) -> bool:
+        """Cancel a running task."""
+        task = self.tasks.get(task_id)
+        if not task:
+            return False
+
+        task.status = TaskStatus.CANCELLED
+        for sub in task.subtasks:
+            if sub.status in (TaskStatus.PENDING, TaskStatus.WAITING, TaskStatus.RUNNING):
+                sub.status = TaskStatus.CANCELLED
+        await self._notify_task_update(task)
+        return True
+
+    async def _run_task(self, task: Task):
+        """Main orchestration loop for a task."""
+        try:
+            # Step 1: Decompose
+            task.status = TaskStatus.DECOMPOSING
+            await self._notify_task_update(task)
+
+            subtasks = await self._decompose(task)
+            if not subtasks:
+                task.status = TaskStatus.FAILED
+                task.error = "Failed to decompose task into subtasks"
+                await self._notify_task_update(task)
+                return
+
+            task.subtasks = subtasks
+            task.status = TaskStatus.RUNNING
+            await self._notify_task_update(task)
+
+            # Step 2: Execute subtasks respecting dependencies
+            await self._execute_subtasks(task)
+
+            # Step 3: Mark complete
+            failed = [s for s in task.subtasks if s.status == TaskStatus.FAILED]
+            if task.status == TaskStatus.CANCELLED:
+                pass  # already set
+            elif failed:
+                task.status = TaskStatus.FAILED
+                task.error = f"{len(failed)} subtask(s) failed"
+            else:
+                task.status = TaskStatus.COMPLETED
+
+            task.finished_at = time.time()
+            await self._notify_task_update(task)
+
+        except Exception as e:
+            log.error(f"Task {task.id} error: {e}", exc_info=True)
+            task.status = TaskStatus.FAILED
+            task.error = str(e)
+            await self._notify_task_update(task)
+
+    async def _decompose(self, task: Task) -> list[Subtask]:
+        """Use `claude -p` to decompose the task into subtasks."""
+        prompt = DECOMPOSE_PROMPT.format(cwd=task.cwd, task=task.prompt)
+
+        log.info(f"Decomposing task {task.id}...")
+        result = await self._run_claude(prompt, task.cwd)
+
+        if not result:
+            log.error(f"Decomposition returned empty result for task {task.id}")
+            return []
+
+        try:
+            # Try to parse JSON — claude might wrap it in markdown
+            text = result.strip()
+            if text.startswith("```"):
+                text = text.split("\n", 1)[1]
+                text = text.rsplit("```", 1)[0]
+
+            data = json.loads(text)
+            subtasks_raw = data.get("subtasks", [])
+
+            subtasks = []
+            for s in subtasks_raw:
+                subtasks.append(Subtask(
+                    id=s["id"],
+                    title=s.get("title", f"Subtask {s['id']}"),
+                    prompt=s["prompt"],
+                    depends_on=s.get("depends_on", []),
+                ))
+
+            log.info(f"Task {task.id} decomposed into {len(subtasks)} subtasks")
+            return subtasks
+
+        except (json.JSONDecodeError, KeyError, TypeError) as e:
+            log.error(f"Failed to parse decomposition: {e}\nRaw: {result[:500]}")
+            # Fallback: treat the whole thing as a single subtask
+            return [Subtask(
+                id="1",
+                title="Full task",
+                prompt=task.prompt,
+            )]
+
+    async def _execute_subtasks(self, task: Task):
+        """Execute subtasks respecting dependencies and parallelism."""
+        while True:
+            if task.status == TaskStatus.CANCELLED:
+                break
+
+            # Check what's done, what's runnable
+            all_done = True
+            any_failed = False
+            running_count = 0
+
+            for sub in task.subtasks:
+                if sub.status == TaskStatus.RUNNING:
+                    running_count += 1
+                    all_done = False
+                elif sub.status in (TaskStatus.PENDING, TaskStatus.WAITING):
+                    all_done = False
+                elif sub.status == TaskStatus.FAILED:
+                    any_failed = True
+
+            if all_done:
+                break
+
+            # Find subtasks ready to run (dependencies met)
+            ready = []
+            for sub in task.subtasks:
+                if sub.status not in (TaskStatus.PENDING, TaskStatus.WAITING):
+                    continue
+
+                deps_met = all(
+                    any(d.id == dep_id and d.status == TaskStatus.COMPLETED
+                        for d in task.subtasks)
+                    for dep_id in sub.depends_on
+                )
+
+                deps_failed = any(
+                    any(d.id == dep_id and d.status == TaskStatus.FAILED
+                        for d in task.subtasks)
+                    for dep_id in sub.depends_on
+                )
+
+                if deps_failed:
+                    sub.status = TaskStatus.FAILED
+                    sub.output = "Dependency failed"
+                    await self._notify_task_update(task)
+                    continue
+
+                if deps_met:
+                    ready.append(sub)
+                else:
+                    sub.status = TaskStatus.WAITING
+
+            # Launch ready subtasks up to max_parallel
+            slots = task.max_parallel - running_count
+            for sub in ready[:slots]:
+                asyncio.create_task(self._run_subtask(task, sub))
+
+            # Wait a bit before checking again
+            await asyncio.sleep(2)
+
+    async def _run_subtask(self, task: Task, subtask: Subtask, continuation_prompt: str = None):
+        """Spawn a Claude Code CLI worker for a subtask, with context rotation."""
+        subtask.status = TaskStatus.RUNNING
+        subtask.started_at = subtask.started_at or time.time()
+        await self._notify_task_update(task)
+
+        rotation_count = 0
+        max_rotations = 5  # Safety limit
+
+        while rotation_count <= max_rotations:
+            log.info(f"Starting subtask {subtask.id}: {subtask.title} (rotation #{rotation_count})")
+
+            try:
+                needs_rotation = await self._run_worker_process(
+                    task, subtask, continuation_prompt
+                )
+
+                if needs_rotation and rotation_count < max_rotations:
+                    # Context limit hit — create checkpoint and rotate
+                    rotation_count += 1
+                    log.info(f"Subtask {subtask.id} hit context limit, rotating (#{rotation_count})")
+
+                    await self.daemon.notify_ws({
+                        "event": "context_rotation",
+                        "task_id": task.id,
+                        "subtask_id": subtask.id,
+                        "context_pct": CONTEXT_ROTATION_THRESHOLD,
+                        "rotation": rotation_count,
+                        "timestamp": time.time(),
+                    })
+
+                    # Read the checkpoint created by the worker itself
+                    checkpoint = await self._read_checkpoint(task, subtask)
+                    continuation_prompt = CHECKPOINT_PROMPT.format(
+                        checkpoint=checkpoint,
+                        original_task=subtask.prompt,
+                    )
+
+                    # Reset output for the new session (keep history in a separate field)
+                    subtask.output += f"\n\n--- CONTEXT ROTATION #{rotation_count} ---\n\n"
+                    subtask.pid = None
+                    continue
+                else:
+                    break
+
+            except Exception as e:
+                subtask.status = TaskStatus.FAILED
+                subtask.output += f"\nError: {e}"
+                subtask.finished_at = time.time()
+                log.error(f"Subtask {subtask.id} error: {e}")
+                break
+
+        await self._notify_task_update(task)
+
+    async def _run_worker_process(self, task: Task, subtask: Subtask,
+                                   continuation_prompt: str = None) -> bool:
+        """
+        Run a claude worker process with context monitoring.
+        Uses `claude` in pipe mode (stdin/stdout) so we can send a checkpoint
+        instruction when context hits 50%.
+        Returns True if context rotation is needed (checkpoint was created).
+        """
+        from .protocol import IS_WINDOWS
+
+        prompt = continuation_prompt or (
+            f"You are worker #{subtask.id} in a coordinated task. "
+            f"Your specific assignment:\n\n{subtask.prompt}\n\n"
+            f"Work in the current directory. Be thorough but focused on your specific task."
+        )
+
+        checkpoint_file = os.path.join(
+            task.cwd,
+            CHECKPOINT_FILENAME.format(subtask_id=subtask.id),
+        )
+
+        # Use -p for the initial prompt — one-shot mode.
+        # For checkpoint-aware rotation, we'll use --output-format=stream-json
+        # so we can detect context usage from the streaming metadata.
+        cmd = ["claude", "-p", prompt, "--output-format", "stream-json"]
+
+        if IS_WINDOWS:
+            CREATE_NO_WINDOW = 0x08000000
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=task.cwd,
+                creationflags=CREATE_NO_WINDOW,
+            )
+        else:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                cwd=task.cwd,
+            )
+
+        subtask.pid = proc.pid
+
+        await self.daemon.notify_ws({
+            "event": "worker_started",
+            "task_id": task.id,
+            "subtask": subtask.to_dict(),
+        })
+
+        # Stream output and monitor for context usage
+        buffer = []
+        needs_rotation = False
+        context_pct = 0
+
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+
+            raw = line.decode("utf-8", errors="replace")
+
+            # Try to parse stream-json events for context info
+            text_to_display = ""
+            try:
+                event = json.loads(raw)
+                # Stream JSON events may contain result with usage info
+                if event.get("type") == "result":
+                    usage = event.get("usage", {})
+                    input_tokens = usage.get("input_tokens", 0)
+                    # Claude Sonnet context is ~200k tokens
+                    # Estimate total context from model
+                    cache_read = usage.get("cache_read_input_tokens", 0)
+                    total_used = input_tokens + cache_read
+                    # Rough estimate: 200k context window
+                    max_context = 200_000
+                    if total_used > 0:
+                        context_pct = int((total_used / max_context) * 100)
+
+                elif event.get("type") == "content_block_delta":
+                    delta = event.get("delta", {})
+                    text_to_display = delta.get("text", "")
+
+                elif event.get("type") == "assistant":
+                    # Initial message, may contain text
+                    content = event.get("message", {}).get("content", [])
+                    for block in content:
+                        if block.get("type") == "text":
+                            text_to_display += block.get("text", "")
+
+            except (json.JSONDecodeError, KeyError):
+                # Not JSON — raw text output
+                text_to_display = raw
+
+            # Also check for context patterns in raw text
+            context_pct = self._parse_context_usage(raw, context_pct)
+
+            if text_to_display:
+                buffer.append(text_to_display)
+                subtask.output += text_to_display
+
+                # Keep output bounded
+                if len(subtask.output) > 100_000:
+                    subtask.output = subtask.output[-100_000:]
+
+            # --- Check if context threshold hit ---
+            if context_pct >= CONTEXT_ROTATION_THRESHOLD and not needs_rotation:
+                log.warning(
+                    f"Subtask {subtask.id} context at {context_pct}% — "
+                    f"asking worker to create checkpoint before rotation"
+                )
+                needs_rotation = True
+
+                # Don't kill yet — instead, let this run finish and then
+                # ask a SEPARATE claude -p to create the checkpoint from
+                # the worker's output + file state. The current -p run
+                # will complete on its own.
+                #
+                # We flag for rotation and let it finish naturally,
+                # or terminate if it's still running after we get the checkpoint.
+
+            # Notify dashboard with batched output
+            if len(buffer) >= 5:
+                await self.daemon.notify_ws({
+                    "event": "worker_output",
+                    "task_id": task.id,
+                    "subtask_id": subtask.id,
+                    "data": "".join(buffer),
+                })
+                buffer = []
+
+        # Flush remaining
+        if buffer:
+            await self.daemon.notify_ws({
+                "event": "worker_output",
+                "task_id": task.id,
+                "subtask_id": subtask.id,
+                "data": "".join(buffer),
+            })
+
+        exit_code = await proc.wait()
+
+        if needs_rotation:
+            # Ask the worker to create a checkpoint by running a new short-lived
+            # claude -p that inspects the current state and writes a checkpoint file
+            await self._ask_worker_to_checkpoint(task, subtask, checkpoint_file)
+            return True
+
+        subtask.exit_code = exit_code
+        subtask.finished_at = time.time()
+
+        # Clean up any leftover checkpoint file from previous rotations
+        if os.path.exists(checkpoint_file):
+            try:
+                os.unlink(checkpoint_file)
+            except OSError:
+                pass
+
+        if exit_code == 0:
+            subtask.status = TaskStatus.COMPLETED
+            log.info(f"Subtask {subtask.id} completed successfully")
+        else:
+            subtask.status = TaskStatus.FAILED
+            log.warning(f"Subtask {subtask.id} failed with exit code {exit_code}")
+
+        return False
+
+    async def _ask_worker_to_checkpoint(self, task: Task, subtask: Subtask,
+                                         checkpoint_file: str):
+        """
+        Spawn a short claude -p to inspect the workspace and create a
+        checkpoint file that the next rotation can pick up.
+        This runs in the same working directory so it can see all files.
+        """
+        checkpoint_prompt = (
+            f"You are creating a handoff checkpoint for the next Claude Code session.\n\n"
+            f"The original task was:\n{subtask.prompt[:1000]}\n\n"
+            f"A previous session was working on this and got partway through.\n"
+            f"Examine the current state of the workspace (files, git status, etc.) "
+            f"and write a checkpoint file to: {checkpoint_file}\n\n"
+            f"The checkpoint MUST include:\n"
+            f"1. What has been accomplished so far (specific files, functions, changes)\n"
+            f"2. What was in progress / partially done\n"
+            f"3. What still needs to be done\n"
+            f"4. Any important context, decisions, or gotchas\n"
+            f"5. Specific next steps for the continuing session\n\n"
+            f"Write the checkpoint file now. Be specific and detailed about file paths "
+            f"and code state. The next session depends on this being accurate."
+        )
+
+        log.info(f"Asking worker to create checkpoint for subtask {subtask.id}...")
+        result = await self._run_claude(checkpoint_prompt, task.cwd)
+
+        # The claude -p should have created the file, but also try to read it
+        if os.path.exists(checkpoint_file):
+            log.info(f"Checkpoint file created at {checkpoint_file}")
+        else:
+            # Fallback: write the output as checkpoint
+            log.warning(f"Checkpoint file not found, using claude output as checkpoint")
+            try:
+                with open(checkpoint_file, "w", encoding="utf-8") as f:
+                    f.write(f"# Checkpoint for subtask {subtask.id}\n\n")
+                    f.write(f"## Original task\n{subtask.prompt[:1000]}\n\n")
+                    f.write(f"## Session output summary\n{result or 'No output'}\n")
+            except Exception as e:
+                log.error(f"Failed to write fallback checkpoint: {e}")
+
+    def _parse_context_usage(self, text: str, current_pct: int) -> int:
+        """
+        Parse context window usage from Claude CLI output.
+        The CLI may show context info in different formats.
+        Returns the latest known context percentage.
+        """
+        import re
+
+        # Pattern: "X% of context used" or "context: X%"
+        m = re.search(r'(\d{1,3})%\s*(?:of\s+)?context', text, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+
+        # Pattern: "Context window: X/Y tokens" — calculate percentage
+        m = re.search(r'(\d[\d,]+)\s*/\s*(\d[\d,]+)\s*tokens', text)
+        if m:
+            used = int(m.group(1).replace(',', ''))
+            total = int(m.group(2).replace(',', ''))
+            if total > 0:
+                return int((used / total) * 100)
+
+        # Pattern: compact status line with percentage
+        m = re.search(r'context[:\s]+(\d{1,3})%', text, re.IGNORECASE)
+        if m:
+            return int(m.group(1))
+
+        return current_pct
+
+    async def _read_checkpoint(self, task: Task, subtask: Subtask) -> str:
+        """
+        Read the checkpoint file created by the previous worker.
+        Falls back to output tail if no checkpoint file exists.
+        """
+        checkpoint_file = os.path.join(
+            task.cwd,
+            CHECKPOINT_FILENAME.format(subtask_id=subtask.id),
+        )
+
+        if os.path.exists(checkpoint_file):
+            try:
+                with open(checkpoint_file, "r", encoding="utf-8") as f:
+                    checkpoint = f.read()
+                log.info(f"Read checkpoint from {checkpoint_file} ({len(checkpoint)} chars)")
+                return checkpoint
+            except Exception as e:
+                log.warning(f"Failed to read checkpoint file: {e}")
+
+        # Fallback: use raw output tail
+        log.warning(f"No checkpoint file found, using output tail")
+        return f"Previous session output (tail):\n{subtask.output[-5000:]}"
+
+    async def _run_claude(self, prompt: str, cwd: str) -> str:
+        """Run `claude -p` and capture output."""
+        from .protocol import IS_WINDOWS
+
+        cmd = ["claude", "-p", prompt]
+
+        try:
+            if IS_WINDOWS:
+                CREATE_NO_WINDOW = 0x08000000
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=cwd,
+                    creationflags=CREATE_NO_WINDOW,
+                )
+            else:
+                proc = await asyncio.create_subprocess_exec(
+                    *cmd,
+                    stdout=asyncio.subprocess.PIPE,
+                    stderr=asyncio.subprocess.PIPE,
+                    cwd=cwd,
+                )
+
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=120)
+            result = stdout.decode("utf-8", errors="replace")
+
+            if proc.returncode != 0:
+                log.warning(f"claude -p returned {proc.returncode}: {stderr.decode()[:200]}")
+
+            return result
+
+        except asyncio.TimeoutError:
+            log.error("claude -p timed out during decomposition")
+            proc.kill()
+            return ""
+        except FileNotFoundError:
+            log.error("'claude' CLI not found. Make sure Claude Code is installed and in PATH.")
+            return ""
+
+    async def _notify_task_update(self, task: Task):
+        """Push task state to dashboard."""
+        await self.daemon.notify_ws({
+            "event": "task_update",
+            "task": task.to_dict(),
+        })
+
+    def get_all_tasks(self) -> list[dict]:
+        """Return all tasks for the API."""
+        return [t.to_dict() for t in self.tasks.values()]
+
+    def get_task(self, task_id: str) -> Optional[dict]:
+        """Return a single task."""
+        task = self.tasks.get(task_id)
+        return task.to_dict() if task else None

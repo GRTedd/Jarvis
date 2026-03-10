@@ -543,6 +543,243 @@
 
   .spawn-dialog .btn { width: 100%; justify-content: center; padding: 10px; }
 
+  /* --- Task Orchestrator --- */
+  .task-bar {
+    background: linear-gradient(135deg, rgba(168, 85, 247, 0.08), rgba(59, 130, 246, 0.08));
+    border-bottom: 1px solid var(--border);
+    padding: 16px 24px;
+  }
+
+  .task-input-row {
+    display: flex;
+    gap: 10px;
+    align-items: stretch;
+  }
+
+  .task-prompt-input {
+    flex: 1;
+    padding: 12px 16px;
+    border-radius: 10px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    outline: none;
+    resize: none;
+    min-height: 44px;
+    max-height: 120px;
+  }
+
+  .task-prompt-input:focus {
+    border-color: var(--purple);
+    box-shadow: 0 0 0 2px rgba(168, 85, 247, 0.3);
+  }
+
+  .task-prompt-input::placeholder { color: var(--text-dim); }
+
+  .task-options {
+    display: flex;
+    gap: 8px;
+    align-items: center;
+  }
+
+  .task-cwd-input {
+    width: 200px;
+    padding: 10px 12px;
+    border-radius: 8px;
+    border: 1px solid var(--border);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 12px;
+    font-family: monospace;
+    outline: none;
+  }
+
+  .task-cwd-input:focus {
+    border-color: var(--purple);
+  }
+
+  .btn-orchestrate {
+    background: linear-gradient(135deg, var(--purple), var(--accent));
+    border: none;
+    color: white;
+    padding: 10px 20px;
+    border-radius: 10px;
+    font-size: 14px;
+    font-weight: 600;
+    cursor: pointer;
+    white-space: nowrap;
+    transition: all 0.2s;
+  }
+
+  .btn-orchestrate:hover {
+    box-shadow: 0 0 25px rgba(168, 85, 247, 0.4);
+    transform: translateY(-1px);
+  }
+
+  .btn-orchestrate:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+  }
+
+  /* --- Task cards --- */
+  .tasks-section {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+  }
+
+  .tasks-section:empty { display: none; }
+
+  .task-card {
+    background: var(--bg-card);
+    border: 1px solid var(--border);
+    border-radius: 12px;
+    margin-bottom: 12px;
+    overflow: hidden;
+  }
+
+  .task-card-header {
+    padding: 12px 16px;
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    border-bottom: 1px solid var(--border);
+    cursor: pointer;
+  }
+
+  .task-card-header:hover { background: var(--bg-card-hover); }
+
+  .task-title-group {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    flex: 1;
+    min-width: 0;
+  }
+
+  .task-status-badge {
+    padding: 3px 10px;
+    border-radius: 12px;
+    font-size: 11px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.5px;
+    white-space: nowrap;
+  }
+
+  .task-status-badge.decomposing {
+    background: rgba(168, 85, 247, 0.15);
+    color: var(--purple);
+  }
+
+  .task-status-badge.running {
+    background: rgba(59, 130, 246, 0.15);
+    color: var(--accent);
+  }
+
+  .task-status-badge.completed {
+    background: rgba(34, 197, 94, 0.15);
+    color: var(--green);
+  }
+
+  .task-status-badge.failed {
+    background: rgba(239, 68, 68, 0.15);
+    color: var(--red);
+  }
+
+  .task-status-badge.cancelled {
+    background: rgba(100, 116, 139, 0.15);
+    color: var(--text-dim);
+  }
+
+  .task-status-badge.pending {
+    background: rgba(234, 179, 8, 0.15);
+    color: var(--yellow);
+  }
+
+  .task-prompt-preview {
+    font-size: 13px;
+    color: var(--text);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    flex: 1;
+  }
+
+  .task-progress-bar {
+    height: 3px;
+    background: var(--border);
+  }
+
+  .task-progress-fill {
+    height: 100%;
+    background: linear-gradient(90deg, var(--purple), var(--green));
+    transition: width 0.5s ease;
+  }
+
+  .task-subtasks {
+    padding: 8px;
+  }
+
+  .subtask-row {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    border-radius: 8px;
+    font-size: 13px;
+    cursor: pointer;
+    transition: background 0.1s;
+  }
+
+  .subtask-row:hover { background: rgba(255,255,255,0.03); }
+
+  .subtask-status-dot {
+    width: 8px; height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+  }
+
+  .subtask-status-dot.pending { background: var(--text-dim); }
+  .subtask-status-dot.waiting { background: var(--yellow); }
+  .subtask-status-dot.running { background: var(--accent); animation: pulse 1.5s infinite; }
+  .subtask-status-dot.completed { background: var(--green); }
+  .subtask-status-dot.failed { background: var(--red); }
+  .subtask-status-dot.cancelled { background: var(--text-dim); }
+
+  .subtask-title {
+    flex: 1;
+    color: var(--text);
+  }
+
+  .subtask-meta {
+    font-size: 11px;
+    color: var(--text-dim);
+  }
+
+  .subtask-output-preview {
+    padding: 6px 12px 12px 30px;
+    font-family: monospace;
+    font-size: 11px;
+    color: var(--text-dim);
+    white-space: pre-wrap;
+    max-height: 120px;
+    overflow-y: auto;
+    display: none;
+  }
+
+  .subtask-output-preview.visible { display: block; }
+
+  .task-actions {
+    padding: 8px 16px;
+    border-top: 1px solid var(--border);
+    display: flex;
+    gap: 8px;
+  }
+
   /* --- Notification toast --- */
   .toast {
     position: fixed;
@@ -569,6 +806,20 @@
 </style>
 </head>
 <body>
+
+<!-- Task Orchestrator Bar -->
+<div class="task-bar">
+  <div class="task-input-row">
+    <textarea class="task-prompt-input" id="taskPrompt" rows="1"
+              placeholder="Give Jarvis a task... (e.g. &quot;Build a REST API with user auth in the backend/ folder&quot;)"
+              onkeydown="if(event.key==='Enter' && !event.shiftKey){event.preventDefault();submitTask();}"></textarea>
+    <input class="task-cwd-input" id="taskCwd" placeholder="Working dir (optional)">
+    <button class="btn-orchestrate" id="orchestrateBtn" onclick="submitTask()">Orchestrate</button>
+  </div>
+</div>
+
+<!-- Active Tasks -->
+<div class="tasks-section" id="tasksSection"></div>
 
 <!-- Header -->
 <div class="header">
@@ -687,6 +938,8 @@ let ws = null;
 let sessions = {};
 let logEntries = [];
 let reconnectTimer = null;
+let tasks = {};
+let expandedSubtasks = {};
 
 // --- Strip ANSI escape codes for display ---
 function stripAnsi(str) {
@@ -800,6 +1053,45 @@ function handleEvent(msg) {
         targets: msg.targets || [],
       };
       logEntries.push(entry);
+      renderLog();
+      break;
+
+    case 'task_submitted':
+    case 'task_update':
+      tasks[msg.task.id] = msg.task;
+      renderTasks();
+      break;
+
+    case 'worker_started':
+      // Update subtask in our local task state
+      if (tasks[msg.task_id]) {
+        const sub = tasks[msg.task_id].subtasks.find(s => s.id === msg.subtask.id);
+        if (sub) Object.assign(sub, msg.subtask);
+        renderTasks();
+      }
+      break;
+
+    case 'worker_output':
+      if (tasks[msg.task_id]) {
+        const sub = tasks[msg.task_id].subtasks.find(s => s.id === msg.subtask_id);
+        if (sub) {
+          sub.output_tail = (sub.output_tail || '') + msg.data;
+          if (sub.output_tail.length > 2000) sub.output_tail = sub.output_tail.slice(-2000);
+          updateSubtaskOutput(msg.task_id, msg.subtask_id);
+        }
+      }
+      break;
+
+    case 'context_rotation':
+      // A worker hit context limit and is being rotated
+      const rotEntry = {
+        timestamp: msg.timestamp || Date.now()/1000,
+        message: `Worker #${msg.subtask_id} hit ${msg.context_pct}% context — rotating to fresh instance`,
+        severity: 'warning',
+        type: 'context_rotation',
+        targets: [msg.task_id],
+      };
+      logEntries.push(rotEntry);
       renderLog();
       break;
   }
@@ -1066,6 +1358,145 @@ setInterval(() => {
   }
 }, 1000);
 
+// --- Task Orchestrator ---
+async function submitTask() {
+  const promptEl = document.getElementById('taskPrompt');
+  const cwdEl = document.getElementById('taskCwd');
+  const btn = document.getElementById('orchestrateBtn');
+  const prompt = promptEl.value.trim();
+  if (!prompt) return;
+
+  btn.disabled = true;
+  btn.textContent = 'Submitting...';
+
+  try {
+    const resp = await fetch(`${API}/api/task`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        prompt,
+        cwd: cwdEl.value.trim() || undefined,
+        max_parallel: 4,
+      }),
+    });
+    const data = await resp.json();
+    if (data.ok) {
+      tasks[data.task.id] = data.task;
+      renderTasks();
+      promptEl.value = '';
+      toast('Task submitted — Jarvis is decomposing...');
+    } else {
+      toast('Error: ' + data.error);
+    }
+  } catch (e) {
+    toast('Error: ' + e.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = 'Orchestrate';
+  }
+}
+
+function renderTasks() {
+  const section = document.getElementById('tasksSection');
+  const taskIds = Object.keys(tasks);
+
+  if (taskIds.length === 0) {
+    section.innerHTML = '';
+    return;
+  }
+
+  // Sort: running first, then by creation time (newest first)
+  taskIds.sort((a, b) => {
+    const ta = tasks[a], tb = tasks[b];
+    const aActive = ['decomposing','running'].includes(ta.status);
+    const bActive = ['decomposing','running'].includes(tb.status);
+    if (aActive !== bActive) return bActive ? 1 : -1;
+    return tb.created_at - ta.created_at;
+  });
+
+  section.innerHTML = '';
+  for (const tid of taskIds) {
+    section.appendChild(createTaskCard(tasks[tid]));
+  }
+}
+
+function createTaskCard(task) {
+  const card = document.createElement('div');
+  card.className = 'task-card';
+  card.id = `task-${task.id}`;
+
+  const p = task.progress || {total:0,completed:0,running:0,failed:0,pending:0};
+  const pct = p.total > 0 ? Math.round((p.completed / p.total) * 100) : 0;
+
+  let subtasksHtml = '';
+  if (task.subtasks && task.subtasks.length > 0) {
+    subtasksHtml = `<div class="task-subtasks">` +
+      task.subtasks.map(s => {
+        const isExpanded = expandedSubtasks[task.id + '-' + s.id];
+        const dur = s.duration ? `${Math.round(s.duration)}s` : '';
+        return `
+          <div class="subtask-row" onclick="toggleSubtask('${task.id}','${s.id}')">
+            <div class="subtask-status-dot ${s.status}"></div>
+            <div class="subtask-title">#${s.id} ${escHtml(s.title)}</div>
+            <div class="subtask-meta">${s.status}${dur ? ' · ' + dur : ''}</div>
+          </div>
+          <div class="subtask-output-preview ${isExpanded ? 'visible' : ''}" id="subout-${task.id}-${s.id}">${escHtml(stripAnsi(s.output_tail || '').split('\\n').slice(-8).join('\\n'))}</div>
+        `;
+      }).join('') +
+      `</div>`;
+  }
+
+  const canCancel = ['decomposing','running','pending'].includes(task.status);
+
+  card.innerHTML = `
+    <div class="task-card-header" onclick="toggleTaskExpand('${task.id}')">
+      <div class="task-title-group">
+        <span class="task-status-badge ${task.status}">${task.status}</span>
+        <span class="task-prompt-preview">${escHtml(task.prompt)}</span>
+      </div>
+      <div style="display:flex;align-items:center;gap:10px;">
+        <span style="font-size:12px;color:var(--text-dim);">${p.completed}/${p.total} done</span>
+        ${canCancel ? `<button class="btn btn-danger" onclick="event.stopPropagation();cancelTask('${task.id}')" style="padding:4px 10px;font-size:11px;">Cancel</button>` : ''}
+      </div>
+    </div>
+    <div class="task-progress-bar"><div class="task-progress-fill" style="width:${pct}%"></div></div>
+    ${subtasksHtml}
+  `;
+
+  return card;
+}
+
+function toggleSubtask(taskId, subId) {
+  const key = taskId + '-' + subId;
+  expandedSubtasks[key] = !expandedSubtasks[key];
+  const el = document.getElementById(`subout-${taskId}-${subId}`);
+  if (el) el.classList.toggle('visible');
+}
+
+function toggleTaskExpand(taskId) {
+  // Could collapse/expand — for now just visual feedback
+}
+
+function updateSubtaskOutput(taskId, subId) {
+  const el = document.getElementById(`subout-${taskId}-${subId}`);
+  if (!el) return;
+  const task = tasks[taskId];
+  if (!task) return;
+  const sub = task.subtasks.find(s => s.id === subId);
+  if (!sub) return;
+  const text = stripAnsi(sub.output_tail || '').split('\n').slice(-8).join('\n');
+  el.textContent = text;
+}
+
+async function cancelTask(taskId) {
+  try {
+    await fetch(`${API}/api/tasks/${taskId}/cancel`, { method: 'POST' });
+    toast('Task cancelled');
+  } catch (e) {
+    toast('Error: ' + e.message);
+  }
+}
+
 // --- Init ---
 connectWS();
 
@@ -1080,6 +1511,14 @@ fetch(`${API}/api/status`).then(r => r.json()).then(data => {
   if (data.coordination_log) logEntries = data.coordination_log;
   renderSessions();
   renderLog();
+}).catch(() => {});
+
+// Load existing tasks
+fetch(`${API}/api/tasks`).then(r => r.json()).then(data => {
+  for (const t of (data.tasks || [])) {
+    tasks[t.id] = t;
+  }
+  renderTasks();
 }).catch(() => {});
 </script>
 </body>

@@ -104,6 +104,10 @@ class JarvisDaemon:
         self._ws_output_pending: dict[str, str] = {}  # batched output per session
         self._web_runner: Optional[web.AppRunner] = None
 
+        # Orchestrator
+        from .orchestrator import Orchestrator
+        self.orchestrator = Orchestrator(self)
+
     async def start(self):
         ensure_jarvis_dir()
 

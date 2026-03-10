@@ -220,23 +220,93 @@ def cmd_logs():
         print("\033[1;36m[JARVIS]\033[0m No log file found. Is daemon running in background?")
 
 
+def cmd_task(args: list[str]):
+    """Submit a task for orchestration via the web API."""
+    if not args:
+        print("Usage: jarvis task \"Your task description here\"")
+        print("       jarvis task --cwd /path/to/project \"Your task\"")
+        sys.exit(1)
+
+    if not daemon_is_running():
+        print("\033[1;31m[JARVIS]\033[0m Daemon not running. Start with: jarvis start -d")
+        return
+
+    # Parse optional --cwd flag
+    cwd = os.getcwd()
+    prompt_parts = []
+    i = 0
+    while i < len(args):
+        if args[i] == "--cwd" and i + 1 < len(args):
+            cwd = args[i + 1]
+            i += 2
+        else:
+            prompt_parts.append(args[i])
+            i += 1
+
+    prompt = " ".join(prompt_parts)
+    if not prompt:
+        print("Usage: jarvis task \"Your task description here\"")
+        return
+
+    from .protocol import WEB_HOST, WEB_PORT
+    import urllib.request
+
+    url = f"http://{WEB_HOST}:{WEB_PORT}/api/task"
+    data = json.dumps({"prompt": prompt, "cwd": cwd}).encode()
+
+    try:
+        req = urllib.request.Request(
+            url, data=data,
+            headers={"Content-Type": "application/json"},
+        )
+        resp = urllib.request.urlopen(req, timeout=10)
+        result = json.loads(resp.read().decode())
+
+        if result.get("ok"):
+            task = result["task"]
+            print(f"\033[1;35m[JARVIS]\033[0m Task submitted: {task['id']}")
+            print(f"  Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
+            print(f"  CWD:    {cwd}")
+            print(f"  Status: {task['status']}")
+            print(f"\n  Dashboard: http://{WEB_HOST}:{WEB_PORT}")
+        else:
+            print(f"\033[1;31m[JARVIS]\033[0m Error: {result.get('error', 'Unknown error')}")
+
+    except Exception as e:
+        print(f"\033[1;31m[JARVIS]\033[0m Failed to submit task: {e}")
+
+
 def print_help():
     print("""
-\033[1;36mJARVIS - CLI Session Coordinator\033[0m
+\033[1;36mJARVIS - CLI Session Coordinator & Orchestrator\033[0m
 
 \033[1mUsage:\033[0m
   jarvis start [-d]          Start daemon (foreground, or -d for background)
   jarvis stop                Stop the daemon
   jarvis status              Show all monitored sessions
   jarvis spawn <cmd> [args]  Run a command under Jarvis monitoring
+  jarvis task "<prompt>"     Submit a task for Jarvis to orchestrate
   jarvis logs                Tail the daemon log
 
-\033[1mHow it works:\033[0m
+\033[1mOrchestration:\033[0m
+  Give Jarvis a high-level task and he'll decompose it, spawn Claude Code
+  workers, and orchestrate them:
+
+    jarvis task "Build a REST API with auth in this project"
+    jarvis task --cwd /path/to/project "Add unit tests for all endpoints"
+
+  Workers auto-rotate when context hits 50% — Jarvis creates a checkpoint
+  and spawns a fresh CLI to continue the work.
+
+\033[1mMonitor sessions:\033[0m
   1. Start the daemon:     jarvis start -d
   2. Spawn sessions:       jarvis spawn claude
                            jarvis spawn bash
                            jarvis spawn npm run dev
   3. Jarvis watches all sessions and coordinates them.
+
+\033[1mDashboard:\033[0m
+  Open http://127.0.0.1:9743 to see the control panel.
 
 \033[1mEnvironment:\033[0m
   Inside monitored sessions, these env vars are set:
@@ -264,6 +334,8 @@ def main():
         cmd_status()
     elif cmd == "spawn":
         cmd_spawn(args[1:])
+    elif cmd == "task":
+        cmd_task(args[1:])
     elif cmd == "logs":
         cmd_logs()
     else:
