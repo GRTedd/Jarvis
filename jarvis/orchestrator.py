@@ -3,6 +3,8 @@ Jarvis Orchestrator — Takes a high-level prompt, decomposes it into subtasks
 using `claude -p`, then spawns and manages Claude Code workers for each subtask.
 
 Uses your Claude Max subscription via the CLI — no API key needed.
+Automatically discovers and forwards all installed plugins, MCP servers,
+and skills to spawned workers.
 """
 
 import asyncio
@@ -21,6 +23,124 @@ if TYPE_CHECKING:
     from .daemon import JarvisDaemon
 
 log = logging.getLogger("jarvis.orchestrator")
+
+
+# ---------------------------------------------------------------------------
+# Plugin / MCP / Skill discovery
+# ---------------------------------------------------------------------------
+
+def _claude_config_dir() -> Path:
+    """Return the Claude Code config directory (~/.claude)."""
+    env = os.environ.get("CLAUDE_CONFIG_DIR")
+    if env:
+        return Path(env)
+    return Path.home() / ".claude"
+
+
+def discover_plugins() -> list[str]:
+    """
+    Discover all enabled plugin directories from the user's Claude Code config.
+
+    Reads ~/.claude/settings.json → enabledPlugins, then resolves each plugin
+    to its latest cached directory under ~/.claude/plugins/cache/<marketplace>/<name>/<version>.
+    Returns a list of absolute paths suitable for --plugin-dir flags.
+    """
+    config_dir = _claude_config_dir()
+    settings_file = config_dir / "settings.json"
+
+    if not settings_file.exists():
+        log.warning("No Claude settings.json found — workers will run without plugins")
+        return []
+
+    try:
+        with open(settings_file, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+    except (json.JSONDecodeError, OSError) as e:
+        log.warning(f"Failed to read Claude settings: {e}")
+        return []
+
+    enabled = settings.get("enabledPlugins", {})
+    cache_root = config_dir / "plugins" / "cache"
+    plugin_dirs = []
+
+    for plugin_key, is_enabled in enabled.items():
+        if not is_enabled:
+            continue
+
+        # plugin_key format: "name@marketplace" e.g. "context7@claude-plugins-official"
+        parts = plugin_key.rsplit("@", 1)
+        if len(parts) != 2:
+            log.debug(f"Skipping malformed plugin key: {plugin_key}")
+            continue
+
+        name, marketplace = parts
+        plugin_cache = cache_root / marketplace / name
+
+        if not plugin_cache.exists():
+            log.debug(f"Plugin cache not found for {plugin_key}: {plugin_cache}")
+            continue
+
+        # Pick the latest version directory (most recently modified)
+        versions = sorted(plugin_cache.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True)
+        if not versions:
+            continue
+
+        latest = versions[0]
+        if latest.is_dir():
+            plugin_dirs.append(str(latest))
+            log.debug(f"Discovered plugin: {name} @ {latest}")
+
+    log.info(f"Discovered {len(plugin_dirs)} plugin(s) for worker forwarding")
+    return plugin_dirs
+
+
+def build_plugin_flags() -> list[str]:
+    """Build CLI flags to forward all discovered plugins to a claude subprocess."""
+    dirs = discover_plugins()
+    flags = []
+    for d in dirs:
+        flags.extend(["--plugin-dir", d])
+    return flags
+
+
+def describe_plugins_for_worker() -> str:
+    """
+    Generate a human-readable summary of available plugins/skills for the worker preamble.
+    Workers should know what tools they have access to.
+    """
+    config_dir = _claude_config_dir()
+    settings_file = config_dir / "settings.json"
+
+    if not settings_file.exists():
+        return ""
+
+    try:
+        with open(settings_file, "r", encoding="utf-8") as f:
+            settings = json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return ""
+
+    enabled = settings.get("enabledPlugins", {})
+    active = [k.rsplit("@", 1)[0] for k, v in enabled.items() if v]
+
+    if not active:
+        return ""
+
+    lines = [
+        "## Available Plugins & Tools",
+        "You have access to the following plugins (with their MCP servers and skills):",
+    ]
+    for name in sorted(active):
+        lines.append(f"  - {name}")
+
+    lines.append("")
+    lines.append(
+        "Use these plugins when they're relevant to your task. For example, use "
+        "playwright for browser testing, firecrawl for web scraping, context7 for "
+        "documentation lookup, github for PR/issue operations, etc."
+    )
+    lines.append("")
+    return "\n".join(lines)
 
 
 class TaskStatus(str, Enum):
@@ -139,7 +259,10 @@ DECOMPOSE_PROMPT = (
     "- Each subtask gets its own terminal - they share the filesystem but not state\n"
     "- Be specific in each subtask prompt - include file paths, function names, etc.\n"
     "- Keep subtask count reasonable (2-8 typically)\n"
-    "- If the task is simple enough for one worker, return just one subtask\n\n"
+    "- If the task is simple enough for one worker, return just one subtask\n"
+    "- Workers have access to these plugins: {plugins}. Instruct workers to use "
+    "relevant plugins when applicable (e.g. playwright for browser testing, "
+    "firecrawl for web scraping, context7 for docs lookup, github for PR ops, etc.)\n\n"
     "Working directory: {cwd}\n\n"
     "Return ONLY valid JSON (no markdown, no explanation) in this exact format:\n"
     '{{\n'
@@ -183,6 +306,7 @@ Every few tool calls, check your inbox:
   curl -s {api_url}/api/agent/poll/{task_id}/{subtask_id}
 Returns {{"messages": [...]}}. Act on any messages you receive.
 
+{plugins_section}
 ---
 """
 
@@ -289,7 +413,17 @@ class Orchestrator:
 
     async def _decompose(self, task: Task) -> list[Subtask]:
         """Use `claude -p` to decompose the task into subtasks."""
-        prompt = DECOMPOSE_PROMPT.format(cwd=task.cwd, task=task.prompt)
+        # List active plugin names for the decomposition prompt
+        try:
+            config_dir = _claude_config_dir()
+            with open(config_dir / "settings.json", "r", encoding="utf-8") as f:
+                _settings = json.load(f)
+            _active = [k.rsplit("@", 1)[0] for k, v in _settings.get("enabledPlugins", {}).items() if v]
+            plugins_str = ", ".join(sorted(_active)) if _active else "none"
+        except Exception:
+            plugins_str = "none"
+
+        prompt = DECOMPOSE_PROMPT.format(cwd=task.cwd, task=task.prompt, plugins=plugins_str)
 
         log.info(f"Decomposing task {task.id}...")
         result = await self._run_claude(prompt, task.cwd)
@@ -462,6 +596,7 @@ class Orchestrator:
             title=subtask.title,
             task_id=task.id,
             api_url=api_url,
+            plugins_section=describe_plugins_for_worker(),
         )
 
         if continuation_prompt:
@@ -481,7 +616,9 @@ class Orchestrator:
         # Use -p for the initial prompt — one-shot mode.
         # For checkpoint-aware rotation, we'll use --output-format=stream-json
         # so we can detect context usage from the streaming metadata.
-        cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose"]
+        # Forward all user plugins so workers have access to MCP servers, skills, etc.
+        plugin_flags = build_plugin_flags()
+        cmd = ["claude", "-p", prompt, "--output-format", "stream-json", "--verbose"] + plugin_flags
 
         if IS_WINDOWS:
             CREATE_NO_WINDOW = 0x08000000
@@ -636,7 +773,8 @@ class Orchestrator:
         """Resume the same session so the original worker writes its own checkpoint."""
         from .protocol import IS_WINDOWS
 
-        cmd = ["claude", "--resume", session_id, "-p", prompt, "--verbose"]
+        plugin_flags = build_plugin_flags()
+        cmd = ["claude", "--resume", session_id, "-p", prompt, "--verbose"] + plugin_flags
 
         kwargs = dict(
             stdout=asyncio.subprocess.PIPE,
@@ -682,10 +820,11 @@ class Orchestrator:
         return f"Previous session output (tail):\n{subtask.output[-5000:]}"
 
     async def _run_claude(self, prompt: str, cwd: str) -> str:
-        """Run `claude -p` and capture output."""
+        """Run `claude -p` and capture output, with all user plugins forwarded."""
         from .protocol import IS_WINDOWS
 
-        cmd = ["claude", "-p", prompt]
+        plugin_flags = build_plugin_flags()
+        cmd = ["claude", "-p", prompt] + plugin_flags
 
         try:
             if IS_WINDOWS:

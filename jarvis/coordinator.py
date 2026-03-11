@@ -52,8 +52,10 @@ async def analyze_sessions_llm(sessions: list[dict]) -> list[dict]:
 
     try:
         from .protocol import IS_WINDOWS
+        from .orchestrator import build_plugin_flags
 
-        cmd = ["claude", "-p", prompt]
+        plugin_flags = build_plugin_flags()
+        cmd = ["claude", "-p", prompt] + plugin_flags
 
         if IS_WINDOWS:
             CREATE_NO_WINDOW = 0x08000000
